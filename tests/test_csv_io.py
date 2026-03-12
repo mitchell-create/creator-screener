@@ -67,8 +67,8 @@ def test_write_output_csv(tmp_output):
     import pandas as pd
     df = pd.read_csv(path)
     assert len(df) == 2
-    assert df.iloc[0]["passed"] is True
-    assert df.iloc[1]["passed"] is False
+    assert bool(df.iloc[0]["passed"]) is True
+    assert bool(df.iloc[1]["passed"]) is False
 
 
 def test_write_passed_only_csv(tmp_output):
