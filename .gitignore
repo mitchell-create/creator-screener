@@ -42,5 +42,9 @@ models/
 .coverage
 htmlcov/
 
+# Pipeline output CSVs (generated at runtime)
+data/*output*.csv
+data/*_passed*.csv
+
 # Claude
 .claude/

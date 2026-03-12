@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -44,6 +43,9 @@ class Settings(BaseSettings):
     # --- I/O ---
     input_csv_path: str = "./data/input.csv"
     output_csv_path: str = "./data/output.csv"
+
+    # --- Tier Failure Rate ---
+    tier_failure_rate: float = 0.5  # Reject affiliate if more than this fraction of videos fail a tier
 
     # --- Scoring Weights ---
     weight_audio: float = 0.35

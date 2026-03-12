@@ -112,7 +112,7 @@ class PipelineOrchestrator:
 
             # If majority of videos fail audio, reject the affiliate
             failure_rate = tier1_failures / len(video_scores)
-            if failure_rate > 0.5:
+            if failure_rate > s.tier_failure_rate:
                 result.video_scores = video_scores
                 result.videos_analyzed = len(video_scores)
                 result.passed = False
@@ -148,7 +148,7 @@ class PipelineOrchestrator:
 
             # If majority of remaining videos fail video quality, reject
             analyzed_tier2 = sum(1 for vs in video_scores if vs.tier_rejected is None or vs.tier_rejected == 2)
-            if analyzed_tier2 > 0 and (tier2_failures / analyzed_tier2) > 0.5:
+            if analyzed_tier2 > 0 and (tier2_failures / analyzed_tier2) > s.tier_failure_rate:
                 result.video_scores = video_scores
                 result.videos_analyzed = len(video_scores)
                 result.passed = False
