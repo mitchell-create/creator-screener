@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Environment
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project-specific
+tmp/
+downloads/
+*.mp4
+*.wav
+*.webm
+*.mkv
+
+# Models (downloaded at runtime)
+models/
+
+# Test artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Claude
+.claude/
