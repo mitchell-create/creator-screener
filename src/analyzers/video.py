@@ -3,69 +3,127 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
+import numpy as np
+import torch
+
 from src.models import VideoQualityResult
 
 logger = logging.getLogger(__name__)
 
 
 class VideoAnalyzer:
-    """Tier 2: Video quality analysis using pyiqa (DOVER) + PySceneDetect."""
+    """Tier 2: Video quality analysis using pyiqa (TOPIQ-NR) + PySceneDetect.
 
-    def __init__(self):
-        self._dover_model = None
+    TOPIQ-NR is a no-reference image quality metric that works on individual
+    frames. We sample frames uniformly from the video, score each, and average.
+    The score (0-1, higher=better) is used for both aesthetic and technical
+    quality dimensions since they are highly correlated in user-generated content.
+    """
+
+    def __init__(self, num_sample_frames: int = 8):
+        self._quality_model = None
         self._device = None
+        self.num_sample_frames = num_sample_frames
 
-    def _load_dover(self) -> None:
-        """Lazy-load DOVER model via pyiqa."""
-        if self._dover_model is not None:
+    def _load_model(self) -> None:
+        """Lazy-load TOPIQ-NR model via pyiqa."""
+        if self._quality_model is not None:
             return
 
         try:
             import pyiqa
-            import torch
 
             self._device = torch.device("cpu")
-            logger.info("Loading DOVER model via pyiqa...")
-            self._dover_model = pyiqa.create_metric("dover", device=self._device)
-            logger.info("DOVER model loaded")
+            logger.info("Loading TOPIQ-NR model via pyiqa...")
+            self._quality_model = pyiqa.create_metric(
+                "topiq_nr", device=self._device
+            )
+            logger.info("TOPIQ-NR model loaded")
         except Exception as e:
-            logger.error(f"Failed to load DOVER model: {e}")
+            logger.error(f"Failed to load TOPIQ-NR model: {e}")
             raise
 
-    def compute_dover_scores(self, video_path: Path) -> tuple[float, float] | None:
-        """
-        Run DOVER to get aesthetic and technical quality scores.
+    def _extract_frames(self, video_path: Path) -> list[np.ndarray]:
+        """Extract uniformly-spaced frames from video using decord.
 
-        Returns (aesthetic, technical) normalized to 0-1 range, or None on failure.
+        Returns list of numpy arrays in (H, W, C) uint8 format.
         """
-        self._load_dover()
-        if self._dover_model is None:
+        try:
+            import decord
+
+            decord.bridge.set_bridge("native")
+            vr = decord.VideoReader(str(video_path))
+            total_frames = len(vr)
+
+            if total_frames == 0:
+                return []
+
+            n = min(self.num_sample_frames, total_frames)
+            # Uniform spacing, avoiding first/last few frames (intros/outros)
+            margin = min(total_frames // 10, 5)
+            usable = total_frames - 2 * margin
+            if usable <= 0:
+                indices = list(range(min(n, total_frames)))
+            else:
+                indices = [
+                    margin + int(i * usable / n)
+                    for i in range(n)
+                ]
+
+            frames = vr.get_batch(indices).asnumpy()  # (N, H, W, C)
+            return [frames[i] for i in range(frames.shape[0])]
+
+        except Exception as e:
+            logger.warning(f"Frame extraction failed for {video_path}: {e}")
+            return []
+
+    def compute_quality_scores(
+        self, video_path: Path
+    ) -> tuple[float, float] | None:
+        """
+        Run TOPIQ-NR on sampled frames to get quality scores.
+
+        Returns (aesthetic, technical) in 0-1 range, or None on failure.
+        Both values use the same TOPIQ-NR score since this single metric
+        captures overall perceptual quality (aesthetic + technical combined).
+        """
+        self._load_model()
+        if self._quality_model is None:
+            return None
+
+        frames = self._extract_frames(video_path)
+        if not frames:
             return None
 
         try:
-            score = self._dover_model(str(video_path))
+            scores = []
+            for frame_np in frames:
+                # Convert (H, W, C) uint8 -> (1, C, H, W) float32 [0, 1]
+                img_tensor = (
+                    torch.from_numpy(frame_np)
+                    .permute(2, 0, 1)
+                    .float()
+                    .div_(255.0)
+                    .unsqueeze(0)
+                    .to(self._device)
+                )
+                with torch.no_grad():
+                    score = self._quality_model(img_tensor)
+                scores.append(float(score.item()))
 
-            # pyiqa's DOVER returns a dict or tensor depending on version
-            if isinstance(score, dict):
-                aesthetic = float(score.get("aesthetic", score.get("a", 0)))
-                technical = float(score.get("technical", score.get("t", 0)))
-            elif hasattr(score, "item"):
-                # Single score - use as both
-                val = float(score.item()) if hasattr(score, "item") else float(score)
-                aesthetic = val
-                technical = val
-            else:
-                aesthetic = float(score)
-                technical = float(score)
+            if not scores:
+                return None
 
-            # Normalize to 0-1 if needed (DOVER raw scores can vary)
-            aesthetic = max(0.0, min(1.0, aesthetic))
-            technical = max(0.0, min(1.0, technical))
+            avg_score = sum(scores) / len(scores)
+            # Clamp to 0-1 range
+            avg_score = max(0.0, min(1.0, avg_score))
 
-            return (aesthetic, technical)
+            # Use the same score for both aesthetic and technical
+            # (TOPIQ-NR captures both aspects of quality)
+            return (avg_score, avg_score)
 
         except Exception as e:
-            logger.warning(f"DOVER scoring failed for {video_path}: {e}")
+            logger.warning(f"Quality scoring failed for {video_path}: {e}")
             return None
 
     def count_scene_cuts(self, video_path: Path) -> int:
@@ -91,15 +149,15 @@ class VideoAnalyzer:
         min_cuts: int = 2,
     ) -> VideoQualityResult:
         """Full video quality analysis for a single video."""
-        # Step 1: DOVER quality scores
-        dover_scores = self.compute_dover_scores(video_path)
-        if dover_scores is None:
+        # Step 1: Quality scores via TOPIQ-NR
+        quality_scores = self.compute_quality_scores(video_path)
+        if quality_scores is None:
             return VideoQualityResult(
                 passed=False,
                 rejection_reason="Failed to analyze video quality",
             )
 
-        aesthetic, technical = dover_scores
+        aesthetic, technical = quality_scores
         overall = (aesthetic + technical) / 2.0
 
         # Step 2: Scene cut detection

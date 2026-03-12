@@ -142,10 +142,9 @@ class AudioAnalyzer:
             )
 
         try:
-            # Load audio
-            import torchaudio
-            waveform, sr = torchaudio.load(str(wav_path))
-            audio_np = waveform.squeeze().numpy()
+            # Load audio using soundfile (more reliable than torchaudio on Windows)
+            import soundfile as sf
+            audio_np, sr = sf.read(str(wav_path), dtype="float32")
 
             # Step 2: VAD - check if there's speech
             speech_pct = self.compute_speech_percentage(audio_np)
