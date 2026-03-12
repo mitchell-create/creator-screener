@@ -53,6 +53,11 @@ class Settings(BaseSettings):
     weight_edits: float = 0.15
     weight_engagement: float = 0.15
 
+    # --- Slack Bot ---
+    slack_bot_token: str = ""    # xoxb-... OAuth bot token
+    slack_app_token: str = ""    # xapp-... Socket Mode app-level token
+    slack_channel_id: str = ""   # Channel ID to watch for CSV uploads
+
     @property
     def temp_path(self) -> Path:
         return Path(self.temp_dir)

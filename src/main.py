@@ -85,6 +85,12 @@ def cli() -> None:
         description="TikTok Affiliate Video Quality Analyzer"
     )
     parser.add_argument(
+        "--mode",
+        choices=["cli", "slack"],
+        default=None,
+        help="Run mode: 'cli' (default, batch CSV) or 'slack' (Slack bot listening for uploads)",
+    )
+    parser.add_argument(
         "--input", "-i",
         default=None,
         help="Path to input CSV (default: from AFF_INPUT_CSV_PATH env var)",
@@ -114,11 +120,22 @@ def cli() -> None:
     args = parser.parse_args()
     setup_logging(args.verbose)
 
-    settings = Settings()
-    input_path = args.input or settings.input_csv_path
-    output_path = args.output or settings.output_csv_path
+    # Determine run mode
+    mode = args.mode
+    if mode is None:
+        settings = Settings()
+        # Check if Slack tokens are configured as a hint for default mode
+        mode = "cli"
 
-    asyncio.run(run_pipeline(input_path, output_path, args.limit, args.dry_run))
+    if mode == "slack":
+        # Deferred import so slack-bolt is not required for CLI mode
+        from src.slack_bot import start_slack_bot
+        asyncio.run(start_slack_bot())
+    else:
+        settings = Settings()
+        input_path = args.input or settings.input_csv_path
+        output_path = args.output or settings.output_csv_path
+        asyncio.run(run_pipeline(input_path, output_path, args.limit, args.dry_run))
 
 
 if __name__ == "__main__":

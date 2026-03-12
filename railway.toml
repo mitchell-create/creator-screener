@@ -3,5 +3,5 @@ builder = "DOCKERFILE"
 dockerfilePath = "Dockerfile"
 
 [deploy]
-startCommand = "python -m src.main"
-restartPolicyType = "NEVER"
+startCommand = "python -m src.main --mode slack"
+restartPolicyType = "ON_FAILURE"

@@ -14,7 +14,7 @@ RUN pip install --no-cache-dir --upgrade pip setuptools wheel
 # Copy project files and install dependencies
 COPY pyproject.toml .
 COPY src/ ./src/
-RUN pip install --no-cache-dir .
+RUN pip install --no-cache-dir ".[slack]"
 
 # Pre-download ML model weights to avoid cold-start latency (~200MB total)
 # Silero VAD (~2MB) + TOPIQ-NR (~173MB)
@@ -33,4 +33,4 @@ ENV AFF_INPUT_CSV_PATH=/data/input.csv \
     AFF_OUTPUT_CSV_PATH=/data/output.csv \
     AFF_TEMP_DIR=/tmp/affiliate_pipeline
 
-ENTRYPOINT ["python", "-m", "src.main"]
+CMD ["python", "-m", "src.main"]

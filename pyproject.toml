@@ -44,6 +44,10 @@ tiktok = [
     "playwright>=1.40.0",
     "playwright-stealth>=1.0.6",
 ]
+slack = [
+    "slack-bolt>=1.18.0",
+    "slack-sdk>=3.27.0",
+]
 dev = [
     "pytest>=7.4.0",
     "pytest-asyncio>=0.23.0",
