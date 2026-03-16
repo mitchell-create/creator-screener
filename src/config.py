@@ -58,6 +58,10 @@ class Settings(BaseSettings):
     slack_app_token: str = ""    # xapp-... Socket Mode app-level token
     slack_channel_id: str = ""   # Channel ID to watch for CSV uploads
 
+    # --- Supabase ---
+    supabase_url: str = ""       # https://xxxx.supabase.co
+    supabase_key: str = ""       # service_role or anon key
+
     @property
     def temp_path(self) -> Path:
         return Path(self.temp_dir)

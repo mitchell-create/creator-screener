@@ -138,6 +138,95 @@ class GeminiAnalyzer:
             return None
 
 
+CATEGORIZATION_PROMPT = """You are a content categorization expert. Based on these key frames from a TikTok creator's videos, categorize their content.
+
+Provide:
+1. category: The single best primary category from this list: beauty, fitness, fashion, food, comedy, lifestyle, tech, gaming, education, music, dance, pets, travel, health, parenting, diy, sports, automotive, finance, other
+2. tags: 2-5 specific content tags (e.g. "skincare", "tutorials", "product-reviews", "meal-prep")
+3. confidence: How confident you are in this categorization (0.0-1.0)
+
+Respond ONLY with a JSON object. No other text.
+Example: {"category": "beauty", "tags": ["skincare", "tutorials", "product-reviews"], "confidence": 0.85}"""
+
+
+class ContentCategorizer:
+    """Categorize affiliate content using Gemini Flash via OpenRouter."""
+
+    OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+    EST_COST_PER_CALL = 0.00025
+
+    def __init__(self, api_key: str, model: str = "google/gemini-2.0-flash-001"):
+        self.api_key = api_key
+        self.model = model
+
+    async def categorize(
+        self,
+        frame_paths: list[Path],
+    ) -> dict | None:
+        """Categorize content from key frames.
+
+        Returns dict with keys: category, tags, confidence. Or None on failure.
+        """
+        if not self.api_key or not frame_paths:
+            return None
+
+        content = [{"type": "text", "text": CATEGORIZATION_PROMPT}]
+        for fp in frame_paths:
+            b64 = _encode_image(fp)
+            if b64:
+                content.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
+                })
+
+        if len(content) < 2:
+            return None
+
+        payload = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": content}],
+            "temperature": 0.1,
+            "max_tokens": 200,
+        }
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.post(
+                    self.OPENROUTER_URL, json=payload, headers=headers,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+
+            text = data["choices"][0]["message"]["content"].strip()
+            return _parse_categorization_response(text)
+
+        except Exception as e:
+            logger.warning(f"Content categorization failed: {e}")
+            return None
+
+
+def _parse_categorization_response(text: str) -> dict | None:
+    """Parse the categorization JSON response."""
+    try:
+        if "```" in text:
+            text = text.split("```")[1]
+            if text.startswith("json"):
+                text = text[4:]
+        data = json.loads(text.strip())
+        return {
+            "category": str(data.get("category", "other")).lower(),
+            "tags": [str(t).lower() for t in data.get("tags", [])],
+            "confidence": min(1.0, max(0.0, float(data.get("confidence", 0.5)))),
+        }
+    except Exception as e:
+        logger.warning(f"Failed to parse categorization response: {e}. Raw: {text[:200]}")
+        return None
+
+
 def _encode_image(path: Path) -> str | None:
     """Read and base64-encode an image file."""
     try:

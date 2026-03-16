@@ -2,6 +2,13 @@
 
 Watches a Slack channel for CSV uploads, runs the pipeline,
 and posts results back to the thread.
+
+Features:
+- Progress updates posted to Slack after each batch
+- Partial results saved to disk after each batch (crash recovery)
+- React with :no_entry: to gracefully stop and get results so far
+- All results (passed AND failed) stored in Supabase for dashboard viewing
+- Passed affiliates auto-categorized by content type via Gemini
 """
 from __future__ import annotations
 
@@ -18,13 +25,25 @@ from slack_sdk.web.async_client import AsyncWebClient
 from src.config import Settings
 from src.io.csv_reader import read_input_csv
 from src.io.csv_writer import write_output_csv, write_passed_only_csv
-from src.models import PipelineStats
+from src.io.supabase_store import SupabaseStore
+from src.models import AffiliateResult, PipelineStats
 from src.pipeline.orchestrator import PipelineOrchestrator
 
 logger = logging.getLogger("affiliate_pipeline.slack")
 
 # Module-level lock: only one pipeline job at a time
 _pipeline_lock = asyncio.Lock()
+
+# Reference to the currently-running orchestrator so we can signal stop
+_active_orchestrator: PipelineOrchestrator | None = None
+
+
+def _create_supabase_store(settings: Settings) -> SupabaseStore | None:
+    """Create a SupabaseStore if credentials are configured."""
+    if settings.supabase_url and settings.supabase_key:
+        return SupabaseStore(settings.supabase_url, settings.supabase_key)
+    logger.warning("Supabase not configured (AFF_SUPABASE_URL / AFF_SUPABASE_KEY) -- results will NOT be persisted")
+    return None
 
 
 def create_app(settings: Settings) -> AsyncApp:
@@ -33,7 +52,7 @@ def create_app(settings: Settings) -> AsyncApp:
 
     @app.event("message")
     async def handle_message(event: dict, client: AsyncWebClient) -> None:
-        """Handle messages — look for CSV file uploads in the target channel."""
+        """Handle messages -- look for CSV file uploads in the target channel."""
         channel = event.get("channel", "")
         subtype = event.get("subtype", "")
 
@@ -60,7 +79,7 @@ def create_app(settings: Settings) -> AsyncApp:
                 break
 
         if csv_file is None:
-            return  # Not a CSV upload — ignore silently
+            return  # Not a CSV upload -- ignore silently
 
         thread_ts = event.get("ts", "")
 
@@ -71,7 +90,8 @@ def create_app(settings: Settings) -> AsyncApp:
                 thread_ts=thread_ts,
                 text=(
                     ":hourglass: *Pipeline is busy*\n"
-                    "A job is currently running. Please wait for it to finish and try again."
+                    "A job is currently running. Please wait for it to finish, "
+                    "or react with :no_entry: on the original upload to stop it early and get partial results."
                 ),
             )
             return
@@ -80,6 +100,30 @@ def create_app(settings: Settings) -> AsyncApp:
         asyncio.create_task(
             _run_pipeline_job(channel, thread_ts, csv_file, settings, client)
         )
+
+    @app.event("reaction_added")
+    async def handle_reaction(event: dict, client: AsyncWebClient) -> None:
+        """Handle reactions -- :no_entry: stops the pipeline gracefully."""
+        global _active_orchestrator
+
+        reaction = event.get("reaction", "")
+        if reaction != "no_entry":
+            return
+
+        if _active_orchestrator is not None and not _active_orchestrator.stop_event.is_set():
+            _active_orchestrator.request_stop()
+
+            channel = event.get("item", {}).get("channel", "")
+            ts = event.get("item", {}).get("ts", "")
+            if channel:
+                await client.chat_postMessage(
+                    channel=channel,
+                    thread_ts=ts,
+                    text=(
+                        ":octagonal_sign: *Stop requested!*\n"
+                        "The pipeline will finish its current batch and then return partial results."
+                    ),
+                )
 
     # Catch-all for unhandled events to prevent warnings
     @app.event({"type": "message", "subtype": "file_share"})
@@ -97,6 +141,11 @@ async def _run_pipeline_job(
     client: AsyncWebClient,
 ) -> None:
     """Download CSV from Slack, run pipeline, post results back."""
+    global _active_orchestrator
+
+    store = _create_supabase_store(settings)
+    run_id: str | None = None
+
     async with _pipeline_lock:
         csv_path = None
         output_dir = None
@@ -129,32 +178,115 @@ async def _run_pipeline_job(
             await client.chat_postMessage(
                 channel=channel,
                 thread_ts=thread_ts,
-                text=f":mag: Found *{len(affiliates)}* affiliates. Running analysis...",
+                text=(
+                    f":mag: Found *{len(affiliates)}* affiliates. Running analysis...\n"
+                    f"_React with :no_entry: to stop early and get partial results._"
+                ),
             )
 
-            # 4. Run the pipeline
-            orchestrator = PipelineOrchestrator(settings)
-            results, stats = await orchestrator.run(affiliates)
+            # 4. Create Supabase run record
+            if store:
+                try:
+                    run_id = await store.create_run(
+                        source="slack",
+                        source_file=file_info.get("name", "unknown.csv"),
+                        total_input=len(affiliates),
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to create Supabase run: {e}")
 
-            # 5. Write output CSVs to temp directory
+            # 5. Set up output directory for incremental saves
             output_dir = Path(tempfile.mkdtemp(prefix="aff_output_"))
             output_path = output_dir / "pipeline_results.csv"
             passed_path = output_dir / "pipeline_results_passed.csv"
+
+            # 6. Create progress callback
+            async def on_batch_complete(
+                batch_idx: int,
+                total_batches: int,
+                results_so_far: list[AffiliateResult],
+                stats: PipelineStats,
+            ) -> None:
+                """Post progress to Slack, save to disk, and sync to Supabase."""
+                # Save partial results to disk
+                write_output_csv(results_so_far, output_path)
+                write_passed_only_csv(results_so_far, passed_path)
+                logger.info(
+                    f"Saved partial results ({len(results_so_far)} affiliates) to {output_path}"
+                )
+
+                # Save to Supabase incrementally
+                if store and run_id:
+                    try:
+                        await store.save_affiliates(run_id, results_so_far)
+                    except Exception as e:
+                        logger.warning(f"Failed to save batch to Supabase: {e}")
+
+                # Post progress update to Slack
+                pass_rate = (
+                    f"{stats.passed / stats.total_processed * 100:.0f}%"
+                    if stats.total_processed > 0
+                    else "N/A"
+                )
+                await client.chat_postMessage(
+                    channel=channel,
+                    thread_ts=thread_ts,
+                    text=(
+                        f":bar_chart: *Progress: Batch {batch_idx}/{total_batches}*\n"
+                        f"Processed: {stats.total_processed}/{stats.total_input} | "
+                        f"Passed: {stats.passed} ({pass_rate}) | "
+                        f"Errors: {stats.errors}"
+                    ),
+                )
+
+            # 7. Run the pipeline with progress tracking
+            orchestrator = PipelineOrchestrator(settings)
+            _active_orchestrator = orchestrator
+            results, stats = await orchestrator.run(
+                affiliates,
+                on_batch_complete=on_batch_complete,
+            )
+
+            # 8. Write final output CSVs
             write_output_csv(results, output_path)
             write_passed_only_csv(results, passed_path)
 
-            # 6. Upload result files to Slack
+            # 9. Final save to Supabase + categorize passed affiliates
+            if store and run_id:
+                try:
+                    affiliate_ids = await store.save_affiliates(run_id, results)
+                    await store.complete_run(run_id, stats)
+
+                    # Categorize passed affiliates
+                    passed_count = sum(1 for r in results if r.passed)
+                    if passed_count > 0:
+                        await _categorize_passed_affiliates(
+                            results, affiliate_ids, store, settings, client, channel, thread_ts,
+                        )
+                except Exception as e:
+                    logger.warning(f"Failed final Supabase save: {e}")
+
+            # 10. Upload result files to Slack
             await _upload_results(client, channel, thread_ts, output_path, passed_path)
 
-            # 7. Post summary
+            # 11. Post summary
+            db_note = ""
+            if store and run_id:
+                db_note = f"\n:card_file_box: Results saved to Supabase (run `{run_id[:8]}...`)"
+
             await client.chat_postMessage(
                 channel=channel,
                 thread_ts=thread_ts,
-                text=_format_summary_message(stats),
+                text=_format_summary_message(stats) + db_note,
             )
 
         except (FileNotFoundError, ValueError) as e:
             logger.error(f"CSV validation error: {e}")
+            if store and run_id:
+                try:
+                    await store.fail_run(run_id, str(e))
+                except Exception:
+                    pass
             await client.chat_postMessage(
                 channel=channel,
                 thread_ts=thread_ts,
@@ -167,18 +299,176 @@ async def _run_pipeline_job(
             )
         except Exception as e:
             logger.error(f"Pipeline job failed: {e}", exc_info=True)
+
+            if store and run_id:
+                try:
+                    await store.fail_run(run_id, str(e))
+                except Exception:
+                    pass
+
+            # If we have partial results, upload them before reporting the error
+            if output_dir and output_dir.exists():
+                output_path = output_dir / "pipeline_results.csv"
+                passed_path = output_dir / "pipeline_results_passed.csv"
+                if output_path.exists() and output_path.stat().st_size > 100:
+                    try:
+                        await _upload_results(
+                            client, channel, thread_ts, output_path, passed_path
+                        )
+                        await client.chat_postMessage(
+                            channel=channel,
+                            thread_ts=thread_ts,
+                            text=":floppy_disk: *Partial results uploaded above* (pipeline crashed mid-run)",
+                        )
+                    except Exception:
+                        logger.warning("Failed to upload partial results after crash")
+
             await client.chat_postMessage(
                 channel=channel,
                 thread_ts=thread_ts,
                 text=_format_error_message(e),
             )
         finally:
+            _active_orchestrator = None
+            if store:
+                await store.close()
             # Cleanup temp files
             if csv_path and Path(csv_path).exists():
                 Path(csv_path).unlink(missing_ok=True)
             if output_dir and output_dir.exists():
                 import shutil
                 shutil.rmtree(output_dir, ignore_errors=True)
+
+
+async def _categorize_passed_affiliates(
+    results: list[AffiliateResult],
+    affiliate_ids: list[str],
+    store: SupabaseStore,
+    settings: Settings,
+    client: AsyncWebClient,
+    channel: str,
+    thread_ts: str,
+) -> None:
+    """Use Gemini to categorize passed affiliates by content type."""
+    from src.analyzers.gemini import ContentCategorizer
+
+    if not settings.openrouter_api_key:
+        return
+
+    categorizer = ContentCategorizer(
+        api_key=settings.openrouter_api_key,
+        model=settings.openrouter_model,
+    )
+
+    # Build a url->id mapping from the results
+    url_to_db_id: dict[str, str] = {}
+    for r, db_id in zip(results, affiliate_ids):
+        if r.passed:
+            url_to_db_id[r.profile_url] = db_id
+
+    if not url_to_db_id:
+        return
+
+    categorized = 0
+    for r in results:
+        if not r.passed:
+            continue
+        db_id = url_to_db_id.get(r.profile_url)
+        if not db_id:
+            continue
+
+        # Use the existing video frames if available, otherwise skip
+        # We'll use the video scores' gemini data as a proxy — if the affiliate
+        # went through Gemini analysis, frames were extracted to a temp dir.
+        # Since temp dirs are cleaned up per-affiliate, we re-use profile metadata.
+        # For now, categorize based on a text-only prompt using profile URL + scores.
+        try:
+            cat_result = await _categorize_from_profile(
+                categorizer, r, settings,
+            )
+            if cat_result:
+                await store.update_categories(
+                    db_id,
+                    category=cat_result["category"],
+                    tags=cat_result["tags"],
+                    confidence=cat_result["confidence"],
+                )
+                categorized += 1
+        except Exception as e:
+            logger.warning(f"Failed to categorize {r.profile_url}: {e}")
+
+    if categorized > 0:
+        logger.info(f"Categorized {categorized} passed affiliates")
+
+
+async def _categorize_from_profile(
+    categorizer,
+    result: AffiliateResult,
+    settings: Settings,
+) -> dict | None:
+    """Categorize an affiliate using a text-based Gemini call (no frames needed)."""
+    import re
+
+    handle_match = re.search(r"tiktok\.com/@([^/?#]+)", result.profile_url)
+    handle = handle_match.group(1) if handle_match else result.profile_url
+
+    prompt = f"""You are a content categorization expert. Based on this TikTok creator's profile and scoring data, categorize their content.
+
+Creator: @{handle}
+Followers: {result.followers or 'unknown'}
+Engagement rate: {result.engagement_rate or 'unknown'}
+Overall quality score: {result.overall_score}
+Audio quality: {result.avg_audio_score}
+Video aesthetic: {result.avg_video_aesthetic}
+Video technical: {result.avg_video_technical}
+Scene cuts avg: {result.avg_scene_cuts}
+
+Provide:
+1. category: The single best primary category from this list: beauty, fitness, fashion, food, comedy, lifestyle, tech, gaming, education, music, dance, pets, travel, health, parenting, diy, sports, automotive, finance, other
+2. tags: 2-5 specific content tags (e.g. "skincare", "tutorials", "product-reviews", "meal-prep")
+3. confidence: How confident you are in this categorization (0.0-1.0). Since you only have metadata and no visual content, confidence should generally be lower (0.3-0.6).
+
+Respond ONLY with a JSON object. No other text.
+Example: {{"category": "beauty", "tags": ["skincare", "tutorials"], "confidence": 0.4}}"""
+
+    payload = {
+        "model": settings.openrouter_model,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.1,
+        "max_tokens": 200,
+    }
+    headers = {
+        "Authorization": f"Bearer {settings.openrouter_api_key}",
+        "Content-Type": "application/json",
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=30) as http_client:
+            resp = await http_client.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                json=payload,
+                headers=headers,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+        text = data["choices"][0]["message"]["content"].strip()
+
+        # Parse JSON response
+        import json
+        if "```" in text:
+            text = text.split("```")[1]
+            if text.startswith("json"):
+                text = text[4:]
+        parsed = json.loads(text.strip())
+        return {
+            "category": str(parsed.get("category", "other")).lower(),
+            "tags": [str(t).lower() for t in parsed.get("tags", [])],
+            "confidence": min(1.0, max(0.0, float(parsed.get("confidence", 0.4)))),
+        }
+    except Exception as e:
+        logger.warning(f"Text-based categorization failed for @{handle}: {e}")
+        return None
 
 
 async def _download_slack_file(
@@ -245,7 +535,8 @@ def _format_started_message(file_info: dict) -> str:
     return (
         f":hourglass_flowing_sand: *Pipeline started*\n"
         f"Processing `{filename}` ({size_kb:.1f} KB)\n"
-        f"This may take several minutes depending on the number of affiliates."
+        f"This may take several minutes depending on the number of affiliates.\n"
+        f"_React with :no_entry: on your upload to stop early and get partial results._"
     )
 
 
@@ -255,8 +546,12 @@ def _format_summary_message(stats: PipelineStats) -> str:
         if stats.total_processed > 0
         else "N/A"
     )
+
+    status_icon = ":octagonal_sign:" if stats.stopped_early else ":white_check_mark:"
+    status_text = "Pipeline stopped early (partial results)" if stats.stopped_early else "Pipeline complete"
+
     return (
-        f":white_check_mark: *Pipeline complete*\n\n"
+        f"{status_icon} *{status_text}*\n\n"
         f"*Input:* {stats.total_input} affiliates\n"
         f"*Processed:* {stats.total_processed}\n"
         f"*Passed:* {stats.passed} ({pass_rate})\n"
@@ -292,7 +587,7 @@ async def start_slack_bot() -> None:
     if settings.slack_channel_id:
         logger.info(f"Watching channel: {settings.slack_channel_id}")
     else:
-        logger.warning("No AFF_SLACK_CHANNEL_ID set — bot will respond in ALL channels")
+        logger.warning("No AFF_SLACK_CHANNEL_ID set -- bot will respond in ALL channels")
 
     app = create_app(settings)
     handler = AsyncSocketModeHandler(app, settings.slack_app_token)

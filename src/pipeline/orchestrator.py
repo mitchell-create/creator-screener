@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from pathlib import Path
+from typing import Callable, Awaitable
 
 from src.acquisition.downloader import download_video
 from src.acquisition.metadata import get_recent_video_urls
@@ -24,6 +25,13 @@ from src.scoring.thresholds import evaluate_affiliate
 
 logger = logging.getLogger(__name__)
 
+# Type alias for the progress callback:
+#   (batch_idx, total_batches, results_so_far, stats) -> None
+BatchProgressCallback = Callable[
+    [int, int, list[AffiliateResult], PipelineStats],
+    Awaitable[None],
+]
+
 
 class PipelineOrchestrator:
     """Controls the tiered filtering pipeline."""
@@ -34,6 +42,8 @@ class PipelineOrchestrator:
         self.audio_analyzer = AudioAnalyzer(sample_rate=settings.audio_sample_rate)
         self.video_analyzer = VideoAnalyzer()
         self.gemini_analyzer: GeminiAnalyzer | None = None
+        # Set this event to signal the pipeline to stop after the current batch
+        self.stop_event = asyncio.Event()
 
         if settings.tier3_enabled and settings.openrouter_api_key:
             self.gemini_analyzer = GeminiAnalyzer(
@@ -71,17 +81,23 @@ class PipelineOrchestrator:
                 stats.errors += 1
                 return result
 
-            # --- Step 2: Download videos ---
+            # --- Step 2: Download videos (concurrently) ---
             logger.info(f"[{affiliate_id}] Downloading {len(video_metas)} videos...")
-            downloaded: dict[str, Path] = {}
-            for meta in video_metas:
-                path = await download_video(
+            download_tasks = [
+                download_video(
                     meta.url,
                     affiliate_dir,
                     max_resolution=s.download_max_resolution,
                     timeout=s.download_timeout_seconds,
                 )
-                if path:
+                for meta in video_metas
+            ]
+            download_results = await asyncio.gather(*download_tasks, return_exceptions=True)
+            downloaded: dict[str, Path] = {}
+            for meta, path in zip(video_metas, download_results):
+                if isinstance(path, Exception):
+                    logger.warning(f"[{affiliate_id}] Download failed for {meta.video_id}: {path}")
+                elif path:
                     downloaded[meta.video_id] = path
 
             result.videos_downloaded = len(downloaded)
@@ -254,34 +270,92 @@ class PipelineOrchestrator:
             # Always clean up temp files
             self.storage.cleanup_affiliate(affiliate_id)
 
+    async def _process_with_semaphore(
+        self,
+        sem: asyncio.Semaphore,
+        affiliate: AffiliateInput,
+        stats: PipelineStats,
+    ) -> AffiliateResult:
+        """Process a single affiliate while respecting the concurrency semaphore."""
+        async with sem:
+            result = await self.process_affiliate(affiliate, stats)
+            stats.total_processed += 1
+            return result
+
+    def request_stop(self) -> None:
+        """Signal the pipeline to stop after the current batch finishes."""
+        logger.info("Stop requested — will finish current batch and return partial results")
+        self.stop_event.set()
+
     async def run(
         self,
         affiliates: list[AffiliateInput],
         limit: int | None = None,
+        on_batch_complete: BatchProgressCallback | None = None,
     ) -> tuple[list[AffiliateResult], PipelineStats]:
-        """Run the full pipeline on a list of affiliates."""
+        """Run the full pipeline on a list of affiliates.
+
+        Args:
+            affiliates: List of affiliates to process.
+            limit: Optional limit on number of affiliates to process.
+            on_batch_complete: Optional async callback invoked after each batch
+                with (batch_idx, total_batches, results_so_far, stats).
+
+        Returns:
+            Tuple of (results, stats). If stopped early via stop_event,
+            stats.stopped_early will be True and only completed results
+            are returned.
+        """
         if limit:
             affiliates = affiliates[:limit]
 
+        self.stop_event.clear()
         stats = PipelineStats(total_input=len(affiliates))
-        results: list[AffiliateResult] = []
+        concurrency = self.settings.max_concurrent_analysis
+        sem = asyncio.Semaphore(concurrency)
 
         batches = chunk_list(affiliates, self.settings.batch_size)
         logger.info(
             f"Processing {len(affiliates)} affiliates in {len(batches)} batches "
-            f"(batch_size={self.settings.batch_size})"
+            f"(batch_size={self.settings.batch_size}, concurrency={concurrency})"
         )
 
+        results: list[AffiliateResult] = []
+
         for batch_idx, batch in enumerate(batches):
+            # Check for stop signal before starting a new batch
+            if self.stop_event.is_set():
+                logger.info(
+                    f"Stop signal received — stopping after batch {batch_idx}/{len(batches)}. "
+                    f"Returning {len(results)} partial results."
+                )
+                stats.stopped_early = True
+                break
+
             logger.info(
                 f"--- Batch {batch_idx + 1}/{len(batches)} "
                 f"({len(batch)} affiliates) ---"
             )
 
-            for affiliate in batch:
-                result = await self.process_affiliate(affiliate, stats)
-                results.append(result)
-                stats.total_processed += 1
+            tasks = [
+                self._process_with_semaphore(sem, affiliate, stats)
+                for affiliate in batch
+            ]
+            batch_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            for i, result in enumerate(batch_results):
+                if isinstance(result, Exception):
+                    logger.error(f"Affiliate failed with exception: {result}")
+                    err_result = AffiliateResult(
+                        profile_url=batch[i].profile_url,
+                        engagement_rate=batch[i].engagement_rate,
+                        followers=batch[i].followers,
+                        error=str(result)[:200],
+                    )
+                    results.append(err_result)
+                    stats.errors += 1
+                else:
+                    results.append(result)
 
             disk_usage = self.storage.get_disk_usage_mb()
             logger.info(
@@ -289,6 +363,13 @@ class PipelineOrchestrator:
                 f"Temp disk usage: {disk_usage:.1f}MB. "
                 f"Passed so far: {stats.passed}/{stats.total_processed}"
             )
+
+            # Fire the progress callback after each batch
+            if on_batch_complete:
+                try:
+                    await on_batch_complete(batch_idx + 1, len(batches), results, stats)
+                except Exception as e:
+                    logger.warning(f"Progress callback failed: {e}")
 
         if self.gemini_analyzer:
             stats.gemini_cost_usd = self.gemini_analyzer.budget.spent_usd
