@@ -49,6 +49,77 @@ class SupabaseStore:
             await self._client.aclose()
 
     # ------------------------------------------------------------------
+    # Dedup: fetch previously scored affiliates
+    # ------------------------------------------------------------------
+
+    async def fetch_existing_results(
+        self,
+        profile_urls: list[str],
+    ) -> dict[str, AffiliateResult]:
+        """Check for affiliates already scored in previous runs.
+
+        Returns a dict of profile_url -> most recent AffiliateResult
+        (only non-errored results). Used to skip re-analysis.
+        """
+        if not profile_urls:
+            return {}
+
+        client = await self._get_client()
+        existing: dict[str, AffiliateResult] = {}
+
+        # Batch URLs to avoid query string length limits
+        batch_size = 50
+        for i in range(0, len(profile_urls), batch_size):
+            batch = profile_urls[i : i + batch_size]
+            # PostgREST in-filter syntax
+            quoted = ",".join(f'"{url}"' for url in batch)
+            params = {
+                "profile_url": f"in.({quoted})",
+                "error": "is.null",
+                "order": "created_at.desc",
+                "select": (
+                    "profile_url,engagement_rate,followers,"
+                    "videos_downloaded,videos_analyzed,"
+                    "avg_audio_score,avg_video_aesthetic,avg_video_technical,"
+                    "avg_scene_cuts,gemini_avg_score,overall_score,"
+                    "passed,is_borderline,rejection_tier,rejection_reason,created_at"
+                ),
+            }
+            resp = await client.get(
+                f"{self.base_url}/rest/v1/affiliates",
+                headers=self.headers,
+                params=params,
+            )
+            resp.raise_for_status()
+            rows = resp.json()
+
+            for row in rows:
+                url = row["profile_url"]
+                # Keep only the first (most recent) result per URL
+                if url in existing:
+                    continue
+                existing[url] = AffiliateResult(
+                    profile_url=url,
+                    engagement_rate=row.get("engagement_rate"),
+                    followers=row.get("followers"),
+                    videos_downloaded=row.get("videos_downloaded", 0),
+                    videos_analyzed=row.get("videos_analyzed", 0),
+                    avg_audio_score=row.get("avg_audio_score"),
+                    avg_video_aesthetic=row.get("avg_video_aesthetic"),
+                    avg_video_technical=row.get("avg_video_technical"),
+                    avg_scene_cuts=row.get("avg_scene_cuts"),
+                    gemini_avg_score=row.get("gemini_avg_score"),
+                    overall_score=row.get("overall_score"),
+                    passed=row.get("passed", False),
+                    is_borderline=row.get("is_borderline", False),
+                    rejection_tier=row.get("rejection_tier"),
+                    rejection_reason=row.get("rejection_reason"),
+                )
+
+        logger.info(f"Dedup: found {len(existing)}/{len(profile_urls)} already scored")
+        return existing
+
+    # ------------------------------------------------------------------
     # Run lifecycle
     # ------------------------------------------------------------------
 

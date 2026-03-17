@@ -87,3 +87,4 @@ class PipelineStats(BaseModel):
     borderline_sent_to_gemini: int = 0
     gemini_cost_usd: float = 0.0
     stopped_early: bool = False
+    skipped_dedup: int = 0

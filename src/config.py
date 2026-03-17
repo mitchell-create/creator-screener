@@ -38,7 +38,8 @@ class Settings(BaseSettings):
 
     # --- Pipeline ---
     batch_size: int = 50
-    max_concurrent_analysis: int = 4
+    max_concurrent_analysis: int = 10
+    dedup_enabled: bool = True
 
     # --- I/O ---
     input_csv_path: str = "./data/input.csv"

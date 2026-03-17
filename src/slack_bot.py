@@ -184,6 +184,29 @@ async def _run_pipeline_job(
                 ),
             )
 
+            # 3b. Dedup: check for previously-scored affiliates
+            dedup_results: list[AffiliateResult] = []
+            new_affiliates = affiliates
+
+            if store and settings.dedup_enabled:
+                try:
+                    profile_urls = [a.profile_url for a in affiliates]
+                    existing = await store.fetch_existing_results(profile_urls)
+                    if existing:
+                        dedup_results = list(existing.values())
+                        new_affiliates = [a for a in affiliates if a.profile_url not in existing]
+                        await client.chat_postMessage(
+                            channel=channel,
+                            thread_ts=thread_ts,
+                            text=(
+                                f":fast_forward: *Dedup:* {len(dedup_results)} already scored "
+                                f"in previous runs — skipping.\n"
+                                f"Analyzing *{len(new_affiliates)}* new affiliates."
+                            ),
+                        )
+                except Exception as e:
+                    logger.warning(f"Dedup check failed, processing all: {e}")
+
             # 4. Create Supabase run record
             if store:
                 try:
@@ -240,31 +263,48 @@ async def _run_pipeline_job(
                 )
 
             # 7. Run the pipeline with progress tracking
-            orchestrator = PipelineOrchestrator(settings)
-            _active_orchestrator = orchestrator
-            results, stats = await orchestrator.run(
-                affiliates,
-                on_batch_complete=on_batch_complete,
-            )
+            if new_affiliates:
+                orchestrator = PipelineOrchestrator(settings)
+                _active_orchestrator = orchestrator
+                new_results, stats = await orchestrator.run(
+                    new_affiliates,
+                    on_batch_complete=on_batch_complete,
+                )
+            else:
+                new_results = []
+                stats = PipelineStats(total_input=len(affiliates))
+
+            # 7b. Merge dedup results into output
+            results = dedup_results + new_results
+            stats.skipped_dedup = len(dedup_results)
+            stats.total_input = len(affiliates)
 
             # 8. Write final output CSVs
             write_output_csv(results, output_path)
             write_passed_only_csv(results, passed_path)
 
             # 9. Final save to Supabase + categorize passed affiliates
+            # Only save newly-processed results (deduped ones already exist)
             if store and run_id:
+                affiliate_ids: list[str] = []
                 try:
-                    affiliate_ids = await store.save_affiliates(run_id, results)
-                    await store.complete_run(run_id, stats)
+                    affiliate_ids = await store.save_affiliates(run_id, new_results)
+                except Exception as e:
+                    logger.warning(f"Failed to save affiliates to Supabase: {e}")
 
-                    # Categorize passed affiliates
-                    passed_count = sum(1 for r in results if r.passed)
-                    if passed_count > 0:
+                try:
+                    await store.complete_run(run_id, stats)
+                except Exception as e:
+                    logger.warning(f"Failed to complete Supabase run: {e}")
+
+                try:
+                    passed_count = sum(1 for r in new_results if r.passed)
+                    if passed_count > 0 and affiliate_ids:
                         await _categorize_passed_affiliates(
-                            results, affiliate_ids, store, settings, client, channel, thread_ts,
+                            new_results, affiliate_ids, store, settings, client, channel, thread_ts,
                         )
                 except Exception as e:
-                    logger.warning(f"Failed final Supabase save: {e}")
+                    logger.warning(f"Failed to categorize affiliates: {e}")
 
             # 10. Upload result files to Slack
             await _upload_results(client, channel, thread_ts, output_path, passed_path)
@@ -550,9 +590,12 @@ def _format_summary_message(stats: PipelineStats) -> str:
     status_icon = ":octagonal_sign:" if stats.stopped_early else ":white_check_mark:"
     status_text = "Pipeline stopped early (partial results)" if stats.stopped_early else "Pipeline complete"
 
+    dedup_line = f"*Skipped (previously scored):* {stats.skipped_dedup}\n" if stats.skipped_dedup > 0 else ""
+
     return (
         f"{status_icon} *{status_text}*\n\n"
         f"*Input:* {stats.total_input} affiliates\n"
+        f"{dedup_line}"
         f"*Processed:* {stats.total_processed}\n"
         f"*Passed:* {stats.passed} ({pass_rate})\n"
         f"*Rejected:*\n"
