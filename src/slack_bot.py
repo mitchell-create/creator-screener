@@ -125,7 +125,7 @@ def create_app(settings: Settings) -> AsyncApp:
         global _active_orchestrator
 
         reaction = event.get("reaction", "")
-        if reaction != "no_entry":
+        if reaction not in ("no_entry", "octagonal_sign", "stop_sign", "hand"):
             return
 
         if _active_orchestrator is not None and not _active_orchestrator.stop_event.is_set():
