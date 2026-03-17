@@ -49,7 +49,10 @@ async def get_recent_video_urls(
 
     def _extract() -> list[VideoMetadata]:
         opts = _build_metadata_opts()
-        opts["playlistend"] = count
+        # Fetch extra videos to account for skipping positions 2 and 3
+        # (likely pinned). We keep video 1 (best content ceiling check),
+        # skip 2-3, then take the rest as typical output.
+        opts["playlistend"] = count + 2
 
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
@@ -62,15 +65,25 @@ async def get_recent_video_urls(
                     # Single video page, not a profile
                     return [_info_to_metadata(result)] if result.get("id") else []
 
-                videos = []
-                for entry in entries[:count]:
+                all_videos = []
+                for entry in entries:
                     if entry is None:
                         continue
                     meta = _info_to_metadata(entry)
                     if meta:
-                        videos.append(meta)
+                        all_videos.append(meta)
 
-                return videos
+                # Keep video 1, skip 2 and 3 (likely pinned), take the rest
+                selected = []
+                for i, video in enumerate(all_videos):
+                    if i == 0:
+                        selected.append(video)
+                    elif i >= 3:
+                        selected.append(video)
+                    if len(selected) >= count:
+                        break
+
+                return selected
 
         except Exception as e:
             logger.warning(f"Failed to get metadata for {profile_url}: {e}")

@@ -68,10 +68,11 @@ def aggregate_scores(
     elif avg_technical is not None:
         avg_video = avg_technical
 
-    # Normalize edit count to 0-1 (cap at 10 cuts = 1.0)
+    # Non-linear bonus: 0 cuts = 0.5 (neutral), more cuts = boost up to 1.0
+    # Talking-head videos (0-1 cuts) are not penalized; well-edited videos get a bonus
     edit_score = None
     if avg_cuts is not None:
-        edit_score = min(1.0, avg_cuts / 10.0)
+        edit_score = 0.5 + 0.5 * min(1.0, avg_cuts / 10.0)
 
     # Normalize engagement rate to 0-1 (cap at 10% = 1.0)
     engagement_score = None
