@@ -29,13 +29,25 @@ from src.io.supabase_store import SupabaseStore
 from src.models import AffiliateResult, PipelineStats
 from src.pipeline.orchestrator import PipelineOrchestrator
 
+from dataclasses import dataclass
+
 logger = logging.getLogger("affiliate_pipeline.slack")
 
-# Module-level lock: only one pipeline job at a time
-_pipeline_lock = asyncio.Lock()
+# Job queue: CSV uploads are queued and processed one at a time
+_job_queue: asyncio.Queue | None = None
+_queue_worker_task: asyncio.Task | None = None
 
 # Reference to the currently-running orchestrator so we can signal stop
 _active_orchestrator: PipelineOrchestrator | None = None
+
+
+@dataclass
+class _PipelineJob:
+    channel: str
+    thread_ts: str
+    file_info: dict
+    settings: Settings
+    client: AsyncWebClient
 
 
 def _create_supabase_store(settings: Settings) -> SupabaseStore | None:
@@ -83,23 +95,29 @@ def create_app(settings: Settings) -> AsyncApp:
 
         thread_ts = event.get("ts", "")
 
-        # Check if pipeline is already running
-        if _pipeline_lock.locked():
+        # Add job to queue
+        global _job_queue, _queue_worker_task
+        if _job_queue is None:
+            _job_queue = asyncio.Queue()
+
+        job = _PipelineJob(channel, thread_ts, csv_file, settings, client)
+        queue_size = _job_queue.qsize()
+
+        if queue_size > 0:
             await client.chat_postMessage(
                 channel=channel,
                 thread_ts=thread_ts,
                 text=(
-                    ":hourglass: *Pipeline is busy*\n"
-                    "A job is currently running. Please wait for it to finish, "
-                    "or react with :no_entry: on the original upload to stop it early and get partial results."
+                    f":clipboard: *Queued* — {queue_size} job{'s' if queue_size > 1 else ''} ahead of you.\n"
+                    f"You'll be notified when processing starts."
                 ),
             )
-            return
 
-        # Run pipeline in background task
-        asyncio.create_task(
-            _run_pipeline_job(channel, thread_ts, csv_file, settings, client)
-        )
+        await _job_queue.put(job)
+
+        # Start the queue worker if not already running
+        if _queue_worker_task is None or _queue_worker_task.done():
+            _queue_worker_task = asyncio.create_task(_queue_worker())
 
     @app.event("reaction_added")
     async def handle_reaction(event: dict, client: AsyncWebClient) -> None:
@@ -133,6 +151,24 @@ def create_app(settings: Settings) -> AsyncApp:
     return app
 
 
+async def _queue_worker() -> None:
+    """Process pipeline jobs from the queue one at a time."""
+    global _job_queue
+    if _job_queue is None:
+        return
+
+    while not _job_queue.empty():
+        job = await _job_queue.get()
+        try:
+            await _run_pipeline_job(
+                job.channel, job.thread_ts, job.file_info, job.settings, job.client,
+            )
+        except Exception as e:
+            logger.error(f"Queue worker caught unhandled error: {e}", exc_info=True)
+        finally:
+            _job_queue.task_done()
+
+
 async def _run_pipeline_job(
     channel: str,
     thread_ts: str,
@@ -146,238 +182,237 @@ async def _run_pipeline_job(
     store = _create_supabase_store(settings)
     run_id: str | None = None
 
-    async with _pipeline_lock:
-        csv_path = None
-        output_dir = None
+    csv_path = None
+    output_dir = None
 
-        try:
-            # 1. Post "processing started" message
-            await client.chat_postMessage(
-                channel=channel,
-                thread_ts=thread_ts,
-                text=_format_started_message(file_info),
-            )
+    try:
+        # 1. Post "processing started" message
+        await client.chat_postMessage(
+            channel=channel,
+            thread_ts=thread_ts,
+            text=_format_started_message(file_info),
+        )
 
-            # 2. Download CSV from Slack
-            csv_path = await _download_slack_file(client, file_info, settings)
-            logger.info(f"Downloaded CSV to {csv_path}")
+        # 2. Download CSV from Slack
+        csv_path = await _download_slack_file(client, file_info, settings)
+        logger.info(f"Downloaded CSV to {csv_path}")
 
-            # 3. Read and validate CSV
-            affiliates = read_input_csv(csv_path)
-            if not affiliates:
-                await client.chat_postMessage(
-                    channel=channel,
-                    thread_ts=thread_ts,
-                    text=(
-                        ":warning: *No valid affiliates found*\n"
-                        "The CSV must contain a `profile_url` column with TikTok profile URLs."
-                    ),
-                )
-                return
-
+        # 3. Read and validate CSV
+        affiliates = read_input_csv(csv_path)
+        if not affiliates:
             await client.chat_postMessage(
                 channel=channel,
                 thread_ts=thread_ts,
                 text=(
-                    f":mag: Found *{len(affiliates)}* affiliates. Running analysis...\n"
-                    f"_React with :no_entry: to stop early and get partial results._"
+                    ":warning: *No valid affiliates found*\n"
+                    "The CSV must contain a `profile_url` column with TikTok profile URLs."
+                ),
+            )
+            return
+
+        await client.chat_postMessage(
+            channel=channel,
+            thread_ts=thread_ts,
+            text=(
+                f":mag: Found *{len(affiliates)}* affiliates. Running analysis...\n"
+                f"_React with :no_entry: to stop early and get partial results._"
+            ),
+        )
+
+        # 3b. Dedup: check for previously-scored affiliates
+        dedup_results: list[AffiliateResult] = []
+        new_affiliates = affiliates
+
+        if store and settings.dedup_enabled:
+            try:
+                profile_urls = [a.profile_url for a in affiliates]
+                existing = await store.fetch_existing_results(profile_urls)
+                if existing:
+                    dedup_results = list(existing.values())
+                    new_affiliates = [a for a in affiliates if a.profile_url not in existing]
+                    await client.chat_postMessage(
+                        channel=channel,
+                        thread_ts=thread_ts,
+                        text=(
+                            f":fast_forward: *Dedup:* {len(dedup_results)} already scored "
+                            f"in previous runs — skipping.\n"
+                            f"Analyzing *{len(new_affiliates)}* new affiliates."
+                        ),
+                    )
+            except Exception as e:
+                logger.warning(f"Dedup check failed, processing all: {e}")
+
+        # 4. Create Supabase run record
+        if store:
+            try:
+                run_id = await store.create_run(
+                    source="slack",
+                    source_file=file_info.get("name", "unknown.csv"),
+                    total_input=len(affiliates),
+                )
+            except Exception as e:
+                logger.warning(f"Failed to create Supabase run: {e}")
+
+        # 5. Set up output directory for incremental saves
+        output_dir = Path(tempfile.mkdtemp(prefix="aff_output_"))
+        output_path = output_dir / "pipeline_results.csv"
+        passed_path = output_dir / "pipeline_results_passed.csv"
+
+        # 6. Create progress callback
+        async def on_batch_complete(
+            batch_idx: int,
+            total_batches: int,
+            results_so_far: list[AffiliateResult],
+            stats: PipelineStats,
+        ) -> None:
+            """Post progress to Slack, save to disk, and sync to Supabase."""
+            # Save partial results to disk
+            write_output_csv(results_so_far, output_path)
+            write_passed_only_csv(results_so_far, passed_path)
+            logger.info(
+                f"Saved partial results ({len(results_so_far)} affiliates) to {output_path}"
+            )
+
+            # Save to Supabase incrementally
+            if store and run_id:
+                try:
+                    await store.save_affiliates(run_id, results_so_far)
+                except Exception as e:
+                    logger.warning(f"Failed to save batch to Supabase: {e}")
+
+            # Post progress update to Slack
+            pass_rate = (
+                f"{stats.passed / stats.total_processed * 100:.0f}%"
+                if stats.total_processed > 0
+                else "N/A"
+            )
+            await client.chat_postMessage(
+                channel=channel,
+                thread_ts=thread_ts,
+                text=(
+                    f":bar_chart: *Progress: Batch {batch_idx}/{total_batches}*\n"
+                    f"Processed: {stats.total_processed}/{stats.total_input} | "
+                    f"Passed: {stats.passed} ({pass_rate}) | "
+                    f"Errors: {stats.errors}"
                 ),
             )
 
-            # 3b. Dedup: check for previously-scored affiliates
-            dedup_results: list[AffiliateResult] = []
-            new_affiliates = affiliates
+        # 7. Run the pipeline with progress tracking
+        if new_affiliates:
+            orchestrator = PipelineOrchestrator(settings)
+            _active_orchestrator = orchestrator
+            new_results, stats = await orchestrator.run(
+                new_affiliates,
+                on_batch_complete=on_batch_complete,
+            )
+        else:
+            new_results = []
+            stats = PipelineStats(total_input=len(affiliates))
 
-            if store and settings.dedup_enabled:
-                try:
-                    profile_urls = [a.profile_url for a in affiliates]
-                    existing = await store.fetch_existing_results(profile_urls)
-                    if existing:
-                        dedup_results = list(existing.values())
-                        new_affiliates = [a for a in affiliates if a.profile_url not in existing]
-                        await client.chat_postMessage(
-                            channel=channel,
-                            thread_ts=thread_ts,
-                            text=(
-                                f":fast_forward: *Dedup:* {len(dedup_results)} already scored "
-                                f"in previous runs — skipping.\n"
-                                f"Analyzing *{len(new_affiliates)}* new affiliates."
-                            ),
-                        )
-                except Exception as e:
-                    logger.warning(f"Dedup check failed, processing all: {e}")
+        # 7b. Merge dedup results into output
+        results = dedup_results + new_results
+        stats.skipped_dedup = len(dedup_results)
+        stats.total_input = len(affiliates)
 
-            # 4. Create Supabase run record
-            if store:
-                try:
-                    run_id = await store.create_run(
-                        source="slack",
-                        source_file=file_info.get("name", "unknown.csv"),
-                        total_input=len(affiliates),
+        # 8. Write final output CSVs
+        write_output_csv(results, output_path)
+        write_passed_only_csv(results, passed_path)
+
+        # 9. Final save to Supabase + categorize passed affiliates
+        # Only save newly-processed results (deduped ones already exist)
+        if store and run_id:
+            affiliate_ids: list[str] = []
+            try:
+                affiliate_ids = await store.save_affiliates(run_id, new_results)
+            except Exception as e:
+                logger.warning(f"Failed to save affiliates to Supabase: {e}")
+
+            try:
+                await store.complete_run(run_id, stats)
+            except Exception as e:
+                logger.warning(f"Failed to complete Supabase run: {e}")
+
+            try:
+                passed_count = sum(1 for r in new_results if r.passed)
+                if passed_count > 0 and affiliate_ids:
+                    await _categorize_passed_affiliates(
+                        new_results, affiliate_ids, store, settings, client, channel, thread_ts,
                     )
-                except Exception as e:
-                    logger.warning(f"Failed to create Supabase run: {e}")
+            except Exception as e:
+                logger.warning(f"Failed to categorize affiliates: {e}")
 
-            # 5. Set up output directory for incremental saves
-            output_dir = Path(tempfile.mkdtemp(prefix="aff_output_"))
+        # 10. Upload result files to Slack
+        await _upload_results(client, channel, thread_ts, output_path, passed_path)
+
+        # 11. Post summary
+        db_note = ""
+        if store and run_id:
+            db_note = f"\n:card_file_box: Results saved to Supabase (run `{run_id[:8]}...`)"
+
+        await client.chat_postMessage(
+            channel=channel,
+            thread_ts=thread_ts,
+            text=_format_summary_message(stats) + db_note,
+        )
+
+    except (FileNotFoundError, ValueError) as e:
+        logger.error(f"CSV validation error: {e}")
+        if store and run_id:
+            try:
+                await store.fail_run(run_id, str(e))
+            except Exception:
+                pass
+        await client.chat_postMessage(
+            channel=channel,
+            thread_ts=thread_ts,
+            text=(
+                f":warning: *Invalid CSV*\n"
+                f"`{e}`\n\n"
+                f"The CSV must contain a `profile_url` column.\n"
+                f"Accepted names: `profile_url`, `url`, `tiktok_url`, `tiktok_link`, `link`, `profile_link`"
+            ),
+        )
+    except Exception as e:
+        logger.error(f"Pipeline job failed: {e}", exc_info=True)
+
+        if store and run_id:
+            try:
+                await store.fail_run(run_id, str(e))
+            except Exception:
+                pass
+
+        # If we have partial results, upload them before reporting the error
+        if output_dir and output_dir.exists():
             output_path = output_dir / "pipeline_results.csv"
             passed_path = output_dir / "pipeline_results_passed.csv"
-
-            # 6. Create progress callback
-            async def on_batch_complete(
-                batch_idx: int,
-                total_batches: int,
-                results_so_far: list[AffiliateResult],
-                stats: PipelineStats,
-            ) -> None:
-                """Post progress to Slack, save to disk, and sync to Supabase."""
-                # Save partial results to disk
-                write_output_csv(results_so_far, output_path)
-                write_passed_only_csv(results_so_far, passed_path)
-                logger.info(
-                    f"Saved partial results ({len(results_so_far)} affiliates) to {output_path}"
-                )
-
-                # Save to Supabase incrementally
-                if store and run_id:
-                    try:
-                        await store.save_affiliates(run_id, results_so_far)
-                    except Exception as e:
-                        logger.warning(f"Failed to save batch to Supabase: {e}")
-
-                # Post progress update to Slack
-                pass_rate = (
-                    f"{stats.passed / stats.total_processed * 100:.0f}%"
-                    if stats.total_processed > 0
-                    else "N/A"
-                )
-                await client.chat_postMessage(
-                    channel=channel,
-                    thread_ts=thread_ts,
-                    text=(
-                        f":bar_chart: *Progress: Batch {batch_idx}/{total_batches}*\n"
-                        f"Processed: {stats.total_processed}/{stats.total_input} | "
-                        f"Passed: {stats.passed} ({pass_rate}) | "
-                        f"Errors: {stats.errors}"
-                    ),
-                )
-
-            # 7. Run the pipeline with progress tracking
-            if new_affiliates:
-                orchestrator = PipelineOrchestrator(settings)
-                _active_orchestrator = orchestrator
-                new_results, stats = await orchestrator.run(
-                    new_affiliates,
-                    on_batch_complete=on_batch_complete,
-                )
-            else:
-                new_results = []
-                stats = PipelineStats(total_input=len(affiliates))
-
-            # 7b. Merge dedup results into output
-            results = dedup_results + new_results
-            stats.skipped_dedup = len(dedup_results)
-            stats.total_input = len(affiliates)
-
-            # 8. Write final output CSVs
-            write_output_csv(results, output_path)
-            write_passed_only_csv(results, passed_path)
-
-            # 9. Final save to Supabase + categorize passed affiliates
-            # Only save newly-processed results (deduped ones already exist)
-            if store and run_id:
-                affiliate_ids: list[str] = []
+            if output_path.exists() and output_path.stat().st_size > 100:
                 try:
-                    affiliate_ids = await store.save_affiliates(run_id, new_results)
-                except Exception as e:
-                    logger.warning(f"Failed to save affiliates to Supabase: {e}")
-
-                try:
-                    await store.complete_run(run_id, stats)
-                except Exception as e:
-                    logger.warning(f"Failed to complete Supabase run: {e}")
-
-                try:
-                    passed_count = sum(1 for r in new_results if r.passed)
-                    if passed_count > 0 and affiliate_ids:
-                        await _categorize_passed_affiliates(
-                            new_results, affiliate_ids, store, settings, client, channel, thread_ts,
-                        )
-                except Exception as e:
-                    logger.warning(f"Failed to categorize affiliates: {e}")
-
-            # 10. Upload result files to Slack
-            await _upload_results(client, channel, thread_ts, output_path, passed_path)
-
-            # 11. Post summary
-            db_note = ""
-            if store and run_id:
-                db_note = f"\n:card_file_box: Results saved to Supabase (run `{run_id[:8]}...`)"
-
-            await client.chat_postMessage(
-                channel=channel,
-                thread_ts=thread_ts,
-                text=_format_summary_message(stats) + db_note,
-            )
-
-        except (FileNotFoundError, ValueError) as e:
-            logger.error(f"CSV validation error: {e}")
-            if store and run_id:
-                try:
-                    await store.fail_run(run_id, str(e))
+                    await _upload_results(
+                        client, channel, thread_ts, output_path, passed_path
+                    )
+                    await client.chat_postMessage(
+                        channel=channel,
+                        thread_ts=thread_ts,
+                        text=":floppy_disk: *Partial results uploaded above* (pipeline crashed mid-run)",
+                    )
                 except Exception:
-                    pass
-            await client.chat_postMessage(
-                channel=channel,
-                thread_ts=thread_ts,
-                text=(
-                    f":warning: *Invalid CSV*\n"
-                    f"`{e}`\n\n"
-                    f"The CSV must contain a `profile_url` column.\n"
-                    f"Accepted names: `profile_url`, `url`, `tiktok_url`, `tiktok_link`, `link`, `profile_link`"
-                ),
-            )
-        except Exception as e:
-            logger.error(f"Pipeline job failed: {e}", exc_info=True)
+                    logger.warning("Failed to upload partial results after crash")
 
-            if store and run_id:
-                try:
-                    await store.fail_run(run_id, str(e))
-                except Exception:
-                    pass
-
-            # If we have partial results, upload them before reporting the error
-            if output_dir and output_dir.exists():
-                output_path = output_dir / "pipeline_results.csv"
-                passed_path = output_dir / "pipeline_results_passed.csv"
-                if output_path.exists() and output_path.stat().st_size > 100:
-                    try:
-                        await _upload_results(
-                            client, channel, thread_ts, output_path, passed_path
-                        )
-                        await client.chat_postMessage(
-                            channel=channel,
-                            thread_ts=thread_ts,
-                            text=":floppy_disk: *Partial results uploaded above* (pipeline crashed mid-run)",
-                        )
-                    except Exception:
-                        logger.warning("Failed to upload partial results after crash")
-
-            await client.chat_postMessage(
-                channel=channel,
-                thread_ts=thread_ts,
-                text=_format_error_message(e),
-            )
-        finally:
-            _active_orchestrator = None
-            if store:
-                await store.close()
-            # Cleanup temp files
-            if csv_path and Path(csv_path).exists():
-                Path(csv_path).unlink(missing_ok=True)
-            if output_dir and output_dir.exists():
-                import shutil
-                shutil.rmtree(output_dir, ignore_errors=True)
+        await client.chat_postMessage(
+            channel=channel,
+            thread_ts=thread_ts,
+            text=_format_error_message(e),
+        )
+    finally:
+        _active_orchestrator = None
+        if store:
+            await store.close()
+        # Cleanup temp files
+        if csv_path and Path(csv_path).exists():
+            Path(csv_path).unlink(missing_ok=True)
+        if output_dir and output_dir.exists():
+            import shutil
+            shutil.rmtree(output_dir, ignore_errors=True)
 
 
 async def _categorize_passed_affiliates(
