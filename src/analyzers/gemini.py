@@ -21,8 +21,11 @@ Based on these key frames from a TikTok video, rate the following on a scale of 
 4. brand_safety: Is the content clean and brand-appropriate? (1=risky, 10=brand-safe)
 5. overall: Overall production quality score (1=very poor, 10=excellent)
 
-Respond ONLY with a JSON object containing these five numeric scores. No other text.
-Example: {"lighting": 7, "composition": 6, "production_value": 5, "brand_safety": 8, "overall": 6}"""
+Also provide:
+6. reasoning: A brief 1-2 sentence explanation of the main quality strengths or issues you observed.
+
+Respond ONLY with a JSON object. No other text.
+Example: {"lighting": 7, "composition": 6, "production_value": 5, "brand_safety": 8, "overall": 6, "reasoning": "Good natural lighting but shaky handheld footage with minimal editing or scene transitions."}"""
 
 
 class BudgetTracker:
@@ -106,7 +109,7 @@ class GeminiAnalyzer:
             "model": self.model,
             "messages": [{"role": "user", "content": content}],
             "temperature": 0.1,
-            "max_tokens": 200,
+            "max_tokens": 300,
         }
 
         headers = {
@@ -253,6 +256,7 @@ def _parse_gemini_response(text: str) -> GeminiResult | None:
             production_value=_clamp(data.get("production_value")),
             brand_safety=_clamp(data.get("brand_safety")),
             overall=_clamp(data.get("overall")),
+            reasoning=data.get("reasoning"),
         )
     except (json.JSONDecodeError, KeyError, TypeError) as e:
         logger.warning(f"Failed to parse Gemini response: {e}. Raw: {text[:200]}")

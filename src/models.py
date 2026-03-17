@@ -32,6 +32,7 @@ class GeminiResult(BaseModel):
     production_value: float | None = None
     brand_safety: float | None = None
     overall: float | None = None
+    reasoning: str | None = None
 
 
 class VideoScore(BaseModel):

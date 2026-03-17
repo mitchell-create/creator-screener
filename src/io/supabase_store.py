@@ -223,6 +223,7 @@ class SupabaseStore:
                         "gemini_production": vs.gemini.production_value,
                         "gemini_brand_safety": vs.gemini.brand_safety,
                         "gemini_overall": vs.gemini.overall,
+                        "gemini_reasoning": vs.gemini.reasoning,
                     })
 
                 video_rows.append(video_row)

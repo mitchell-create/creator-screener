@@ -241,10 +241,13 @@ class PipelineOrchestrator:
                         ):
                             result.passed = False
                             result.rejection_tier = 3
-                            result.rejection_reason = (
+                            reason = (
                                 f"Gemini score {gemini_result.overall:.1f} "
                                 f"< {s.gemini_min_score}"
                             )
+                            if gemini_result.reasoning:
+                                reason += f" — {gemini_result.reasoning}"
+                            result.rejection_reason = reason
                             stats.rejected_tier3 += 1
                             logger.info(
                                 f"[{affiliate_id}] REJECTED (Tier 3): {result.rejection_reason}"
