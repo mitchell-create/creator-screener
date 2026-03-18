@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import tempfile
+import time
 from pathlib import Path
 
 import httpx
@@ -184,6 +185,8 @@ async def _run_pipeline_job(
 
     csv_path = None
     output_dir = None
+    heartbeat_task: asyncio.Task | None = None
+    _pipeline_start_time: float | None = None
 
     try:
         # 1. Post "processing started" message
@@ -259,6 +262,9 @@ async def _run_pipeline_job(
         passed_path = output_dir / "pipeline_results_passed.csv"
 
         # 6. Create progress callback
+        _last_heartbeat_time = time.monotonic()
+        _pipeline_start_time = time.monotonic()
+
         async def on_batch_complete(
             batch_idx: int,
             total_batches: int,
@@ -266,6 +272,8 @@ async def _run_pipeline_job(
             stats: PipelineStats,
         ) -> None:
             """Post progress to Slack, save to disk, and sync to Supabase."""
+            nonlocal _last_heartbeat_time
+
             # Save partial results to disk
             write_output_csv(results_so_far, output_path)
             write_passed_only_csv(results_so_far, passed_path)
@@ -286,25 +294,87 @@ async def _run_pipeline_job(
                 if stats.total_processed > 0
                 else "N/A"
             )
+            elapsed = time.monotonic() - _pipeline_start_time
+            elapsed_str = _format_duration(elapsed)
+
+            issues = []
+            if stats.timeouts > 0:
+                issues.append(f":warning: {stats.timeouts} timed out")
+            if stats.errors > stats.timeouts:
+                issues.append(f":x: {stats.errors - stats.timeouts} other errors")
+            issues_line = "\n" + " | ".join(issues) if issues else ""
+
             await client.chat_postMessage(
                 channel=channel,
                 thread_ts=thread_ts,
                 text=(
-                    f":bar_chart: *Progress: Batch {batch_idx}/{total_batches}*\n"
+                    f":bar_chart: *Progress: Batch {batch_idx}/{total_batches}* ({elapsed_str} elapsed)\n"
                     f"Processed: {stats.total_processed}/{stats.total_input} | "
                     f"Passed: {stats.passed} ({pass_rate}) | "
                     f"Errors: {stats.errors}"
+                    f"{issues_line}"
                 ),
             )
+            _last_heartbeat_time = time.monotonic()
+
+        async def _heartbeat_loop(
+            stats: PipelineStats,
+            total_input: int,
+        ) -> None:
+            """Post a status update to Slack every 30 minutes while the pipeline runs."""
+            nonlocal _last_heartbeat_time
+            while True:
+                await asyncio.sleep(60)  # Check every minute
+                since_last = time.monotonic() - _last_heartbeat_time
+                if since_last < 1800:  # 30 minutes
+                    continue
+                elapsed = time.monotonic() - _pipeline_start_time
+                elapsed_str = _format_duration(elapsed)
+                pass_rate = (
+                    f"{stats.passed / stats.total_processed * 100:.0f}%"
+                    if stats.total_processed > 0
+                    else "N/A"
+                )
+                issues = []
+                if stats.timeouts > 0:
+                    issues.append(f":warning: {stats.timeouts} timed out")
+                if stats.errors > stats.timeouts:
+                    issues.append(f":x: {stats.errors - stats.timeouts} other errors")
+                issues_line = "\n" + " | ".join(issues) if issues else ""
+
+                try:
+                    await client.chat_postMessage(
+                        channel=channel,
+                        thread_ts=thread_ts,
+                        text=(
+                            f":heartbeat: *Still running* ({elapsed_str} elapsed)\n"
+                            f"Processed: {stats.total_processed}/{total_input} | "
+                            f"Passed: {stats.passed} ({pass_rate}) | "
+                            f"Errors: {stats.errors}"
+                            f"{issues_line}"
+                        ),
+                    )
+                except Exception as e:
+                    logger.warning(f"Heartbeat message failed: {e}")
+                _last_heartbeat_time = time.monotonic()
 
         # 7. Run the pipeline with progress tracking
+        heartbeat_task = None
         if new_affiliates:
             orchestrator = PipelineOrchestrator(settings)
             _active_orchestrator = orchestrator
-            new_results, stats = await orchestrator.run(
-                new_affiliates,
-                on_batch_complete=on_batch_complete,
+            stats = PipelineStats(total_input=len(affiliates))
+            heartbeat_task = asyncio.create_task(
+                _heartbeat_loop(stats, len(affiliates))
             )
+            try:
+                new_results, stats = await orchestrator.run(
+                    new_affiliates,
+                    on_batch_complete=on_batch_complete,
+                )
+            finally:
+                if heartbeat_task:
+                    heartbeat_task.cancel()
         else:
             new_results = []
             stats = PipelineStats(total_input=len(affiliates))
@@ -398,13 +468,16 @@ async def _run_pipeline_job(
                 except Exception:
                     logger.warning("Failed to upload partial results after crash")
 
+        elapsed = time.monotonic() - _pipeline_start_time if _pipeline_start_time else None
         await client.chat_postMessage(
             channel=channel,
             thread_ts=thread_ts,
-            text=_format_error_message(e),
+            text=_format_error_message(e, elapsed),
         )
     finally:
         _active_orchestrator = None
+        if heartbeat_task and not heartbeat_task.done():
+            heartbeat_task.cancel()
         if store:
             await store.close()
         # Cleanup temp files
@@ -627,8 +700,19 @@ def _format_summary_message(stats: PipelineStats) -> str:
 
     dedup_line = f"*Skipped (previously scored):* {stats.skipped_dedup}\n" if stats.skipped_dedup > 0 else ""
 
+    issues_line = ""
+    if stats.timeouts > 0 or stats.errors > 0:
+        parts = []
+        if stats.timeouts > 0:
+            parts.append(f":warning: *{stats.timeouts} affiliates timed out* (metadata/download too slow)")
+        non_timeout_errors = stats.errors - stats.timeouts
+        if non_timeout_errors > 0:
+            parts.append(f":x: *{non_timeout_errors} other errors* (check logs for details)")
+        issues_line = "\n".join(parts) + "\n\n"
+
     return (
         f"{status_icon} *{status_text}*\n\n"
+        f"{issues_line}"
         f"*Input:* {stats.total_input} affiliates\n"
         f"{dedup_line}"
         f"*Processed:* {stats.total_processed}\n"
@@ -643,11 +727,25 @@ def _format_summary_message(stats: PipelineStats) -> str:
     )
 
 
-def _format_error_message(error: Exception) -> str:
+def _format_duration(seconds: float) -> str:
+    """Format seconds into a human-readable duration string."""
+    minutes = int(seconds // 60)
+    if minutes < 60:
+        return f"{minutes}m"
+    hours = minutes // 60
+    remaining_min = minutes % 60
+    return f"{hours}h {remaining_min}m"
+
+
+def _format_error_message(error: Exception, elapsed_seconds: float | None = None) -> str:
     error_str = str(error)[:500]
+    elapsed_line = ""
+    if elapsed_seconds is not None:
+        elapsed_line = f"\nFailed after {_format_duration(elapsed_seconds)} of processing.\n"
     return (
         f":x: *Pipeline failed*\n\n"
         f"Error: `{error_str}`\n"
+        f"{elapsed_line}"
         f"Check Railway logs for full details."
     )
 

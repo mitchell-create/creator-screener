@@ -37,8 +37,9 @@ class Settings(BaseSettings):
     gemini_weekly_budget_usd: float = 1.00
 
     # --- Pipeline ---
-    batch_size: int = 50
+    batch_size: int = 15
     max_concurrent_analysis: int = 10
+    per_affiliate_timeout: int = 180  # 3 minutes max per affiliate
     dedup_enabled: bool = True
 
     # --- I/O ---

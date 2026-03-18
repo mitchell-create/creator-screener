@@ -88,3 +88,4 @@ class PipelineStats(BaseModel):
     gemini_cost_usd: float = 0.0
     stopped_early: bool = False
     skipped_dedup: int = 0
+    timeouts: int = 0

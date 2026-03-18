@@ -280,22 +280,24 @@ class PipelineOrchestrator:
         stats: PipelineStats,
     ) -> AffiliateResult:
         """Process a single affiliate while respecting the concurrency semaphore."""
+        timeout = self.settings.per_affiliate_timeout
         async with sem:
             try:
                 result = await asyncio.wait_for(
                     self.process_affiliate(affiliate, stats),
-                    timeout=600,  # 10-minute max per affiliate
+                    timeout=timeout,
                 )
             except asyncio.TimeoutError:
                 affiliate_id = self.storage.get_affiliate_id(affiliate.profile_url)
-                logger.error(f"[{affiliate_id}] Timed out after 10 minutes")
+                logger.error(f"[{affiliate_id}] Timed out after {timeout}s")
                 result = AffiliateResult(
                     profile_url=affiliate.profile_url,
                     engagement_rate=affiliate.engagement_rate,
                     followers=affiliate.followers,
-                    error="Timed out after 10 minutes",
+                    error=f"Timed out after {timeout}s",
                 )
                 stats.errors += 1
+                stats.timeouts += 1
             stats.total_processed += 1
             return result
 
