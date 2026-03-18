@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import tempfile
 from pathlib import Path
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+_DEFAULT_TEMP_DIR = str(Path(tempfile.gettempdir()) / "affiliate_pipeline")
 
 
 class Settings(BaseSettings):
@@ -12,7 +15,7 @@ class Settings(BaseSettings):
     videos_per_profile: int = 5
     download_concurrency: int = 10
     download_timeout_seconds: int = 120
-    temp_dir: str = "/tmp/affiliate_pipeline"
+    temp_dir: str = _DEFAULT_TEMP_DIR
     download_max_resolution: int = 720
 
     # --- Tier 1: Audio ---

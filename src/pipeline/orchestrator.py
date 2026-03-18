@@ -70,9 +70,13 @@ class PipelineOrchestrator:
 
         try:
             # --- Step 1: Get video URLs ---
+            # Reconstruct full URL for yt-dlp if profile_url is just a handle
+            fetch_url = affiliate.profile_url
+            if fetch_url.startswith("@"):
+                fetch_url = f"https://tiktok.com/{fetch_url}"
             logger.info(f"[{affiliate_id}] Fetching video URLs...")
             video_metas = await get_recent_video_urls(
-                affiliate.profile_url,
+                fetch_url,
                 count=s.videos_per_profile,
             )
 

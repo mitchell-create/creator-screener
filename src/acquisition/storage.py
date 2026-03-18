@@ -44,9 +44,15 @@ class TempVideoStorage:
         return total / (1024 * 1024)
 
     def get_affiliate_id(self, profile_url: str) -> str:
-        """Extract a safe identifier from a TikTok profile URL."""
-        # https://www.tiktok.com/@username -> username
+        """Extract a safe identifier from a TikTok profile URL or @handle."""
+        import re
+
+        # Handle @username format directly
+        if profile_url.startswith("@"):
+            return profile_url[1:]
+        match = re.search(r"tiktok\.com/@([^/?#]+)", profile_url)
+        if match:
+            return match.group(1)
+        # Fallback for non-standard URLs
         url = profile_url.rstrip("/")
-        if "/@" in url:
-            return url.split("/@")[-1]
         return url.split("/")[-1]

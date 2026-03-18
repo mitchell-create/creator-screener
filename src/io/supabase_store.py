@@ -21,7 +21,9 @@ _TIMEOUT = 30.0
 
 
 def _extract_handle(profile_url: str) -> str | None:
-    """Extract TikTok handle from a profile URL."""
+    """Extract TikTok handle from a profile URL or @handle string."""
+    if profile_url.startswith("@"):
+        return profile_url[1:]
     match = re.search(r"tiktok\.com/@([^/?#]+)", profile_url)
     return match.group(1) if match else None
 

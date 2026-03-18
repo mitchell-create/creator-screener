@@ -5,13 +5,39 @@ from pathlib import Path
 
 import pandas as pd
 
+import re
+
 from src.models import AffiliateInput
 
 logger = logging.getLogger(__name__)
 
+# Regex to extract the TikTok handle from any tiktok.com URL
+_TIKTOK_HANDLE_RE = re.compile(r"tiktok\.com/@([^/?#]+)")
+
+
+def _normalize_to_handle(value: str) -> str:
+    """Normalize any TikTok identifier to just the @handle.
+
+    Accepts:
+      - Full video URLs: 'https://tiktok.com/@user/video/123' -> '@user'
+      - Profile URLs: 'https://tiktok.com/@user' -> '@user'
+      - @handles: '@user' -> '@user'
+      - Bare handles: 'user' -> '@user'
+    """
+    match = _TIKTOK_HANDLE_RE.search(value)
+    if match:
+        return f"@{match.group(1)}"
+    # Already an @handle
+    if value.startswith("@"):
+        return value
+    # Bare handle (no URL, no @) — prefix it
+    if "/" not in value and "." not in value:
+        return f"@{value}"
+    return value
+
 # Map common column name variations to our standardized names
 COLUMN_ALIASES = {
-    "profile_url": ["profile_url", "url", "tiktok_url", "tiktok_link", "link", "profile_link"],
+    "profile_url": ["profile_url", "url", "tiktok_url", "tiktok_link", "link", "profile_link", "handle"],
     "engagement_rate": ["engagement_rate", "engagement", "er", "eng_rate"],
     "followers": ["followers", "follower_count", "follower", "subs", "subscribers"],
 }
@@ -55,10 +81,26 @@ def read_input_csv(path: str | Path) -> list[AffiliateInput]:
         )
 
     affiliates = []
+    seen_urls: set[str] = set()
+    duplicates = 0
+    normalized = 0
+
     for _, row in df.iterrows():
         url = str(row["profile_url"]).strip()
         if not url or url == "nan":
             continue
+
+        # Normalize to @handle format (handles URLs, bare handles, etc.)
+        original_url = url
+        url = _normalize_to_handle(url)
+        if url != original_url:
+            normalized += 1
+
+        # Deduplicate by normalized profile URL
+        if url in seen_urls:
+            duplicates += 1
+            continue
+        seen_urls.add(url)
 
         affiliate = AffiliateInput(
             profile_url=url,
@@ -67,6 +109,10 @@ def read_input_csv(path: str | Path) -> list[AffiliateInput]:
         )
         affiliates.append(affiliate)
 
+    if normalized > 0:
+        logger.info(f"Normalized {normalized} video URLs to profile URLs")
+    if duplicates > 0:
+        logger.info(f"Skipped {duplicates} duplicate profile URLs")
     logger.info(f"Loaded {len(affiliates)} affiliates from {path}")
     return affiliates
 

@@ -557,8 +557,11 @@ async def _categorize_from_profile(
     """Categorize an affiliate using a text-based Gemini call (no frames needed)."""
     import re
 
-    handle_match = re.search(r"tiktok\.com/@([^/?#]+)", result.profile_url)
-    handle = handle_match.group(1) if handle_match else result.profile_url
+    if result.profile_url.startswith("@"):
+        handle = result.profile_url[1:]
+    else:
+        handle_match = re.search(r"tiktok\.com/@([^/?#]+)", result.profile_url)
+        handle = handle_match.group(1) if handle_match else result.profile_url
 
     prompt = f"""You are a content categorization expert. Based on this TikTok creator's profile and scoring data, categorize their content.
 
