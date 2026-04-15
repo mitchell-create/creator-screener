@@ -48,6 +48,10 @@ slack = [
     "slack-bolt>=1.18.0",
     "slack-sdk>=3.27.0",
 ]
+embeddings = [
+    # Optional: local embeddings for brand-fit matching (free, no API)
+    "sentence-transformers>=2.2.0",
+]
 dev = [
     "pytest>=7.4.0",
     "pytest-asyncio>=0.23.0",

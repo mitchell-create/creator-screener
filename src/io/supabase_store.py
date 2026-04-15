@@ -220,6 +220,27 @@ class SupabaseStore:
                 "tiktok_handle": _extract_handle(r.profile_url),
                 "engagement_rate": r.engagement_rate,
                 "followers": r.followers,
+
+                # Creator enrichment scores
+                "creator_score": r.creator_score,
+                "creator_engagement_score": r.creator_engagement_score,
+                "creator_follower_quality": r.creator_follower_quality,
+                "creator_consistency": r.creator_consistency,
+                "creator_authenticity": r.creator_authenticity,
+                "creator_brand_fit": r.creator_brand_fit,
+                "creator_tier": r.creator_tier,
+                "creator_flags": r.creator_flags,
+
+                # Scraped platform data
+                "tiktok_followers_scraped": r.tiktok_followers_scraped,
+                "tiktok_following": r.tiktok_following,
+                "tiktok_total_likes": r.tiktok_total_likes,
+                "tiktok_engagement_rate_scraped": r.tiktok_engagement_rate_scraped,
+                "instagram_handle": r.instagram_handle,
+                "instagram_followers": r.instagram_followers,
+                "instagram_engagement_rate": r.instagram_engagement_rate,
+
+                # Video analysis scores
                 "videos_downloaded": r.videos_downloaded,
                 "videos_analyzed": r.videos_analyzed,
                 "avg_audio_score": r.avg_audio_score,

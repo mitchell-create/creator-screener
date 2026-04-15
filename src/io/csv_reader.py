@@ -31,7 +31,8 @@ def _normalize_to_handle(value: str) -> str:
     if value.startswith("@"):
         return value
     # Bare handle (no URL, no @) — prefix it
-    if "/" not in value and "." not in value:
+    # Handles may contain dots (e.g. "ward.mama"), so only skip if it looks like a real URL
+    if "://" not in value:
         return f"@{value}"
     return value
 
@@ -40,6 +41,10 @@ COLUMN_ALIASES = {
     "profile_url": ["profile_url", "url", "tiktok_url", "tiktok_link", "link", "profile_link", "handle"],
     "engagement_rate": ["engagement_rate", "engagement", "er", "eng_rate"],
     "followers": ["followers", "follower_count", "follower", "subs", "subscribers"],
+    "instagram_handle": [
+        "instagram_handle", "ig_handle", "instagram", "ig", "ig_username",
+        "instagram_url", "ig_url", "instagram_link",
+    ],
 }
 
 
@@ -60,8 +65,15 @@ def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def read_input_csv(path: str | Path) -> list[AffiliateInput]:
-    """Read and validate the input CSV. Returns list of AffiliateInput models."""
+def read_input_csv(
+    path: str | Path,
+) -> tuple[list[AffiliateInput], dict[str, str]]:
+    """Read and validate the input CSV.
+
+    Returns:
+        Tuple of (affiliates, instagram_handles) where instagram_handles
+        maps profile_url -> ig_handle for creators with IG data.
+    """
     path = Path(path)
     if not path.exists():
         raise FileNotFoundError(f"Input CSV not found: {path}")
@@ -69,7 +81,7 @@ def read_input_csv(path: str | Path) -> list[AffiliateInput]:
     df = pd.read_csv(path)
     if df.empty:
         logger.warning("Input CSV is empty")
-        return []
+        return [], {}
 
     df = _normalize_columns(df)
 
@@ -80,7 +92,10 @@ def read_input_csv(path: str | Path) -> list[AffiliateInput]:
             f"Accepted names: {COLUMN_ALIASES['profile_url']}"
         )
 
+    has_ig = "instagram_handle" in df.columns
+
     affiliates = []
+    instagram_handles: dict[str, str] = {}
     seen_urls: set[str] = set()
     duplicates = 0
     normalized = 0
@@ -109,12 +124,34 @@ def read_input_csv(path: str | Path) -> list[AffiliateInput]:
         )
         affiliates.append(affiliate)
 
+        # Extract Instagram handle if present
+        if has_ig:
+            ig_raw = str(row.get("instagram_handle", "")).strip()
+            if ig_raw and ig_raw != "nan":
+                # Normalize IG handle: strip @, extract from URL if needed
+                ig_handle = _normalize_ig_handle(ig_raw)
+                if ig_handle:
+                    instagram_handles[url] = ig_handle
+
     if normalized > 0:
         logger.info(f"Normalized {normalized} video URLs to profile URLs")
     if duplicates > 0:
         logger.info(f"Skipped {duplicates} duplicate profile URLs")
+    if instagram_handles:
+        logger.info(f"Found {len(instagram_handles)} Instagram handles")
     logger.info(f"Loaded {len(affiliates)} affiliates from {path}")
-    return affiliates
+    return affiliates, instagram_handles
+
+
+def _normalize_ig_handle(value: str) -> str | None:
+    """Normalize an Instagram identifier to a bare handle (no @)."""
+    value = value.strip().rstrip("/")
+    # URL: https://instagram.com/username
+    ig_match = re.search(r"instagram\.com/([^/?#]+)", value)
+    if ig_match:
+        return ig_match.group(1).lstrip("@")
+    # @handle or bare handle
+    return value.lstrip("@") if value else None
 
 
 def _safe_float(val) -> float | None:

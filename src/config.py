@@ -52,11 +52,35 @@ class Settings(BaseSettings):
     # --- Tier Failure Rate ---
     tier_failure_rate: float = 0.5  # Reject affiliate if more than this fraction of videos fail a tier
 
-    # --- Scoring Weights ---
+    # --- Scoring Weights (Video Quality) ---
     weight_audio: float = 0.35
     weight_video: float = 0.35
     weight_edits: float = 0.15
     weight_engagement: float = 0.15
+
+    # --- Creator Enrichment & Scoring ---
+    firecrawl_api_key: str = ""
+    enrichment_enabled: bool = True
+    enrichment_concurrency: int = 5  # Concurrent Firecrawl scrapes
+
+    # Creator score weights (0-1, auto-normalized)
+    creator_weight_engagement: float = 0.35
+    creator_weight_follower_quality: float = 0.25
+    creator_weight_consistency: float = 0.20
+    creator_weight_authenticity: float = 0.20
+
+    # Pre-filter: reject creators below this creator_score before video analysis
+    # Set to 0.0 to disable pre-filtering
+    creator_score_min: float = 0.0
+
+    # Brand-fit matching
+    brand_fit_enabled: bool = False
+    embedding_model: str = "openai/text-embedding-3-small"
+    use_local_embeddings: bool = False  # Use sentence-transformers instead of API
+
+    # --- Discovery ---
+    discovery_max_creators: int = 100
+    discovery_platforms: str = "tiktok,instagram"  # Comma-separated
 
     # --- Slack Bot ---
     slack_bot_token: str = ""    # xoxb-... OAuth bot token

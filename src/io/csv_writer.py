@@ -28,6 +28,27 @@ def write_output_csv(
             "profile_url": r.profile_url,
             "engagement_rate": r.engagement_rate,
             "followers": r.followers,
+
+            # Creator-level scores (Tier 0 enrichment)
+            "creator_score": _round(r.creator_score),
+            "creator_tier": r.creator_tier or "",
+            "creator_engagement_score": _round(r.creator_engagement_score),
+            "creator_follower_quality": _round(r.creator_follower_quality),
+            "creator_consistency": _round(r.creator_consistency),
+            "creator_authenticity": _round(r.creator_authenticity),
+            "creator_brand_fit": _round(r.creator_brand_fit),
+            "creator_flags": r.creator_flags or "",
+
+            # Scraped platform data
+            "tiktok_followers_scraped": r.tiktok_followers_scraped,
+            "tiktok_following": r.tiktok_following,
+            "tiktok_total_likes": r.tiktok_total_likes,
+            "tiktok_engagement_rate_scraped": _round(r.tiktok_engagement_rate_scraped),
+            "instagram_handle": r.instagram_handle or "",
+            "instagram_followers": r.instagram_followers,
+            "instagram_engagement_rate": _round(r.instagram_engagement_rate),
+
+            # Video quality scores
             "videos_analyzed": r.videos_analyzed,
             "avg_audio_score": _round(r.avg_audio_score),
             "avg_video_aesthetic": _round(r.avg_video_aesthetic),

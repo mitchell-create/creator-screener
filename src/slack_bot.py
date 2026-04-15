@@ -201,7 +201,7 @@ async def _run_pipeline_job(
         logger.info(f"Downloaded CSV to {csv_path}")
 
         # 3. Read and validate CSV
-        affiliates = read_input_csv(csv_path)
+        affiliates, instagram_handles = read_input_csv(csv_path)
         if not affiliates:
             await client.chat_postMessage(
                 channel=channel,
@@ -357,6 +357,41 @@ async def _run_pipeline_job(
                 except Exception as e:
                     logger.warning(f"Heartbeat message failed: {e}")
                 _last_heartbeat_time = time.monotonic()
+
+        # 6b. Creator enrichment (Tier 0)
+        if settings.enrichment_enabled and new_affiliates:
+            from src.pipeline.enrichment import CreatorEnrichmentPipeline
+            from src.models import AffiliateInput
+
+            await client.chat_postMessage(
+                channel=channel,
+                thread_ts=thread_ts,
+                text=f":mag_right: *Enriching {len(new_affiliates)} creators* (scraping TikTok profiles)...",
+            )
+            try:
+                enrichment = CreatorEnrichmentPipeline(settings=settings)
+                enriched = await enrichment.enrich_affiliates(
+                    new_affiliates,
+                    instagram_handles=instagram_handles if instagram_handles else None,
+                )
+                before_count = len(new_affiliates)
+                new_affiliates = [
+                    AffiliateInput(
+                        profile_url=e.profile_url,
+                        engagement_rate=e.engagement_rate,
+                        followers=e.followers,
+                    )
+                    for e in enriched
+                ]
+                filtered = before_count - len(new_affiliates)
+                if filtered > 0:
+                    await client.chat_postMessage(
+                        channel=channel,
+                        thread_ts=thread_ts,
+                        text=f":scissors: Pre-filtered {filtered} low-scoring creators. {len(new_affiliates)} proceeding to video analysis.",
+                    )
+            except Exception as e:
+                logger.warning(f"Enrichment failed, continuing without: {e}")
 
         # 7. Run the pipeline with progress tracking
         heartbeat_task = None

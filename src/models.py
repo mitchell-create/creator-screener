@@ -62,6 +62,25 @@ class AffiliateResult(BaseModel):
     avg_scene_cuts: float | None = None
     gemini_avg_score: float | None = None
 
+    # Creator-level scores (from enrichment / Tier 0)
+    creator_score: float | None = None
+    creator_engagement_score: float | None = None
+    creator_follower_quality: float | None = None
+    creator_consistency: float | None = None
+    creator_authenticity: float | None = None
+    creator_brand_fit: float | None = None
+    creator_tier: str | None = None  # nano, micro, mid, macro, mega
+    creator_flags: str | None = None  # Comma-separated warning flags
+
+    # Platform data (scraped)
+    tiktok_followers_scraped: int | None = None
+    tiktok_following: int | None = None
+    tiktok_total_likes: int | None = None
+    tiktok_engagement_rate_scraped: float | None = None
+    instagram_handle: str | None = None
+    instagram_followers: int | None = None
+    instagram_engagement_rate: float | None = None
+
     # Final verdict
     overall_score: float | None = None
     passed: bool = False
@@ -89,3 +108,8 @@ class PipelineStats(BaseModel):
     stopped_early: bool = False
     skipped_dedup: int = 0
     timeouts: int = 0
+
+    # Enrichment stats
+    enriched: int = 0
+    enrichment_failed: int = 0
+    pre_filtered: int = 0  # Creators filtered out by creator_score_min
