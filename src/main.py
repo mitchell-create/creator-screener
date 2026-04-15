@@ -301,18 +301,43 @@ async def run_discovery(
     )
 
 
+async def _run_modash(
+    input_path: str,
+    output_path: str,
+    settings: Settings,
+) -> None:
+    """Run the Modash pipeline: IG handles → TikTok filter → enrich → score."""
+    from src.pipeline.modash_pipeline import run_modash_pipeline
+
+    if not settings.rapidapi_key:
+        logger.warning(
+            "AFF_RAPIDAPI_KEY not set — IG enrichment will be skipped. "
+            "Scoring will use TikTok data only."
+        )
+
+    await run_modash_pipeline(
+        input_path=input_path,
+        output_path=output_path,
+        settings=settings,
+        tiktok_concurrency=settings.modash_tiktok_concurrency,
+        ig_concurrency=settings.modash_ig_concurrency,
+        ig_post_count=settings.modash_ig_post_count,
+    )
+
+
 def cli() -> None:
     parser = argparse.ArgumentParser(
         description="TikTok Affiliate Video Quality Analyzer"
     )
     parser.add_argument(
         "--mode",
-        choices=["cli", "slack", "discover"],
+        choices=["cli", "slack", "discover", "modash"],
         default=None,
         help=(
             "Run mode: 'cli' (default, batch CSV processing), "
             "'slack' (Slack bot), "
-            "'discover' (find creators from hashtags/campaign brief)"
+            "'discover' (find creators from hashtags/campaign brief), "
+            "'modash' (IG creators from Modash → TikTok filter → score)"
         ),
     )
     parser.add_argument(
@@ -370,7 +395,12 @@ def cli() -> None:
         settings = Settings()
         mode = "cli"
 
-    if mode == "slack":
+    if mode == "modash":
+        settings = Settings()
+        input_path = args.input or settings.input_csv_path
+        output_path = args.output or "./data/modash_scored.csv"
+        asyncio.run(_run_modash(input_path, output_path, settings))
+    elif mode == "slack":
         # Deferred import so slack-bolt is not required for CLI mode
         from src.slack_bot import start_slack_bot
         asyncio.run(start_slack_bot())

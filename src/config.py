@@ -60,8 +60,14 @@ class Settings(BaseSettings):
 
     # --- Creator Enrichment & Scoring ---
     firecrawl_api_key: str = ""
+    rapidapi_key: str = ""  # RapidAPI key for Instagram Scraper API
     enrichment_enabled: bool = True
-    enrichment_concurrency: int = 5  # Concurrent Firecrawl scrapes
+    enrichment_concurrency: int = 5  # Concurrent scrapes
+
+    # Modash pipeline settings
+    modash_tiktok_concurrency: int = 5  # Concurrent yt-dlp TikTok checks
+    modash_ig_concurrency: int = 3  # Concurrent RapidAPI IG calls (keep low for rate limits)
+    modash_ig_post_count: int = 12  # Recent posts to fetch per IG creator
 
     # Creator score weights (0-1, auto-normalized)
     creator_weight_engagement: float = 0.35
