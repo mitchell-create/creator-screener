@@ -115,33 +115,39 @@ MEDIUM_KEYWORDS: dict[str, float] = {
 
 WEAK_KEYWORDS: dict[str, float] = {
     # Lifestyle adjacent — alone not enough, but supportive
-    "recipe": 0.3,
-    "recipes": 0.3,
-    "skincare": 0.5,
-    "skin care": 0.5,
-    "natural": 0.3,
-    "balance": 0.3,
-    "energy": 0.3,
-    "body": 0.2,
-    "mindful": 0.5,
-    "meditation": 0.4,
-    "yoga": 0.5,
-    "pilates": 0.4,
-    "active": 0.2,
-    "lifestyle": 0.2,
-    "routine": 0.3,
-    "clean": 0.2,
-    "healthy": 0.5,
-    "health": 0.5,
+    # NOTE: skincare, recipe, food by themselves do NOT indicate health/wellness.
+    # A food blogger who just eats food is not a fit. A skincare-only creator is not a fit.
+    # These only matter when combined with actual health signals.
+    "recipe": 0.1,
+    "recipes": 0.1,
+    "skincare": 0.1,     # Downweighted — pure skincare ≠ health/wellness
+    "skin care": 0.1,
+    "hair health": 0.1,  # Downweighted — pure hair ≠ health/wellness
+    "natural": 0.2,
+    "balance": 0.2,
+    "energy": 0.2,
+    "body": 0.1,
+    "mindful": 0.4,
+    "meditation": 0.3,
+    "yoga": 0.3,
+    "pilates": 0.3,
+    "active": 0.1,
+    "lifestyle": 0.1,
+    "routine": 0.1,
+    "clean": 0.1,
+    "healthy": 0.3,
+    "health": 0.3,
 }
 
 # Combine all keywords
 ALL_KEYWORDS: dict[str, float] = {**STRONG_KEYWORDS, **MEDIUM_KEYWORDS, **WEAK_KEYWORDS}
 
-# Thresholds
-KEYWORD_PASS_THRESHOLD = 4.0    # Total weighted score to auto-pass
-KEYWORD_FAIL_THRESHOLD = 1.0    # Below this → auto-fail (no health signal)
-# Between fail and pass → ambiguous → send to LLM
+# Thresholds — intentionally strict. We'd rather send borderline cases to
+# the LLM than auto-pass creators who just happen to use health-adjacent words.
+# Pure skincare, food, or beauty creators should NOT auto-pass.
+KEYWORD_PASS_THRESHOLD = 6.0    # Total weighted score to auto-pass (needs strong health signals)
+KEYWORD_FAIL_THRESHOLD = 0.5    # Below this → auto-fail (truly zero health signal)
+# Between fail and pass → ambiguous → send to LLM for proper judgment
 
 
 @dataclass
@@ -269,7 +275,7 @@ async def llm_content_fit(
     if len(content_sample) > 3000:
         content_sample = content_sample[:3000] + "...[truncated]"
 
-    prompt = f"""You are evaluating whether a social media creator is a good fit to promote a product as an affiliate partner.
+    prompt = f"""You are evaluating whether a social media creator is a good fit to promote a PROBIOTIC GUT HEALTH SUPPLEMENT as an affiliate partner.
 
 **Product/Campaign:**
 {campaign_brief}
@@ -280,15 +286,28 @@ async def llm_content_fit(
 **Recent Content (video descriptions & post captions):**
 {content_sample}
 
-**Task:**
-Rate how relevant this creator's content is for promoting this product on a scale of 0-10:
-- 0-2: Not relevant at all (content has nothing to do with health, wellness, or related topics)
-- 3-4: Slightly relevant (occasional health mentions but not a core theme)
-- 5-6: Moderately relevant (some health/wellness content but mixed with unrelated topics)
-- 7-8: Very relevant (health/wellness is a significant part of their content)
-- 9-10: Perfect fit (health, nutrition, supplements, or gut health is their primary focus)
+**IMPORTANT DISTINCTIONS — read carefully:**
 
-A creator does NOT need to be a health professional. Lifestyle creators who regularly discuss wellness routines, supplements, healthy eating, fitness, or body care are a good fit.
+GOOD FIT examples:
+- Creators who discuss physical health, nutrition, supplements, wellness routines, gut health, digestive issues, healthy eating habits, fitness + nutrition, holistic health, functional medicine
+- GLP-1/weight loss medication creators ARE a good fit (gut health is a common concern for GLP-1 users)
+- Fitness creators who also discuss nutrition, supplements, or wellness routines
+- Lifestyle creators who regularly discuss their health journey, supplement stacks, or wellness habits
+
+NOT A FIT examples:
+- Pure skincare/beauty creators who ONLY discuss topical products (serums, makeup, hair products) without discussing internal health, nutrition, or supplements
+- Pure food/recipe creators who just eat or cook food without discussing health benefits, nutrition, or dietary wellness
+- Pet health creators (cat nutrition, dog supplements, etc.)
+- Fashion, travel, home decor, book, or entertainment-only creators
+- Creators who mention "healthy" occasionally but whose content is clearly not health-focused
+
+The key question: Does this creator regularly talk about PHYSICAL HEALTH, NUTRITION, or WELLNESS in a way that would make a probiotic supplement feel natural in their content?
+
+Rate on a scale of 0-10:
+- 0-3: Not a fit (content doesn't meaningfully cover health/wellness/nutrition)
+- 4-5: Borderline (some health adjacent content but not core to their brand)
+- 6-7: Good fit (health/wellness is a regular theme alongside other content)
+- 8-10: Excellent fit (health, nutrition, or supplements are central to their content)
 
 Respond with ONLY a JSON object:
 {{"score": <0-10>, "reasoning": "<1-2 sentence explanation>"}}"""
@@ -386,7 +405,7 @@ async def evaluate_content_fit(
         # LLM score 0-10 → normalize to 0-1
         result.score = llm_score / 10.0
 
-        if llm_score >= 5.0:
+        if llm_score >= 6.0:
             result.passed = True
             result.reason = f"LLM approved ({llm_score}/10): {llm_reasoning}"
         else:
