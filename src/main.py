@@ -305,8 +305,9 @@ async def _run_modash(
     input_path: str,
     output_path: str,
     settings: Settings,
+    campaign_brief: str = "",
 ) -> None:
-    """Run the Modash pipeline: IG handles → TikTok filter → enrich → score."""
+    """Run the Modash pipeline: IG handles → TikTok filter → enrich → content-fit → score."""
     from src.pipeline.modash_pipeline import run_modash_pipeline
 
     if not settings.rapidapi_key:
@@ -319,6 +320,7 @@ async def _run_modash(
         input_path=input_path,
         output_path=output_path,
         settings=settings,
+        campaign_brief=campaign_brief,
         tiktok_concurrency=settings.modash_tiktok_concurrency,
         ig_concurrency=settings.modash_ig_concurrency,
         ig_post_count=settings.modash_ig_post_count,
@@ -399,7 +401,10 @@ def cli() -> None:
         settings = Settings()
         input_path = args.input or settings.input_csv_path
         output_path = args.output or "./data/modash_scored.csv"
-        asyncio.run(_run_modash(input_path, output_path, settings))
+        asyncio.run(_run_modash(
+            input_path, output_path, settings,
+            campaign_brief=args.campaign_brief,
+        ))
     elif mode == "slack":
         # Deferred import so slack-bolt is not required for CLI mode
         from src.slack_bot import start_slack_bot

@@ -24,6 +24,11 @@ from src.acquisition.instagram_enricher import (
     InstagramProfileData,
     batch_enrich_instagram,
 )
+from src.analyzers.content_fit import (
+    ContentFitResult,
+    batch_evaluate_content_fit,
+    DEFAULT_CAMPAIGN_BRIEF,
+)
 from src.config import Settings
 from src.models_creator import CreatorProfile, PlatformMetrics
 from src.scoring.creator_signals import score_creator
@@ -56,6 +61,9 @@ class ModashPipelineStats:
     ig_enrich_failed: int = 0
     tiktok_enriched: int = 0
     tiktok_enrich_failed: int = 0
+    content_fit_passed: int = 0
+    content_fit_failed: int = 0
+    content_fit_llm_reviewed: int = 0
     scored: int = 0
     output_written: int = 0
 
@@ -87,6 +95,12 @@ class ScoredCreator:
     tiktok_avg_saves: float | None = None
     tiktok_engagement_rate: float | None = None
     tiktok_video_count: int | None = None
+
+    # Content-fit
+    content_fit_score: float | None = None
+    content_fit_passed: bool = True
+    content_fit_method: str = ""
+    content_fit_reason: str = ""
 
     # Creator scores (0.0 - 1.0)
     engagement_score: float | None = None
@@ -190,6 +204,7 @@ async def run_modash_pipeline(
     input_path: str,
     output_path: str,
     settings: Settings,
+    campaign_brief: str = "",
     tiktok_concurrency: int = 5,
     ig_concurrency: int = 3,
     ig_post_count: int = 12,
@@ -295,24 +310,70 @@ async def run_modash_pipeline(
     stats.tiktok_enriched = sum(1 for v in tiktok_data.values() if v is not None)
     stats.tiktok_enrich_failed = len(survivors) - stats.tiktok_enriched
 
-    # --- Step 5: Score and output ---
+    # --- Step 5: Content-Fit Filter ---
     logger.info("=" * 60)
-    logger.info("STEP 5: Scoring creators")
+    logger.info("STEP 5: Content-fit filter (keyword scan + LLM for ambiguous)")
+    logger.info("=" * 60)
+
+    # Build content bundles for each creator
+    creators_content: list[dict] = []
+    for creator in survivors:
+        tk = tiktok_data.get(creator.tiktok_handle)
+        ig = ig_data.get(creator.ig_handle)
+
+        tk_descriptions = tk.get("descriptions", []) if tk else []
+        ig_captions = [p.caption for p in ig.recent_posts if p.caption] if ig else []
+        bio = ig.bio if ig and ig.bio else ""
+
+        creators_content.append({
+            "handle": creator.ig_handle,
+            "tiktok_descriptions": tk_descriptions,
+            "ig_captions": ig_captions,
+            "bio": bio,
+        })
+
+    content_fit_results = await batch_evaluate_content_fit(
+        creators_content=creators_content,
+        campaign_brief=campaign_brief,
+        openrouter_api_key=settings.openrouter_api_key,
+        openrouter_model=settings.openrouter_model,
+        concurrency=3,
+    )
+
+    stats.content_fit_passed = sum(1 for r in content_fit_results.values() if r.passed)
+    stats.content_fit_failed = sum(1 for r in content_fit_results.values() if not r.passed)
+    stats.content_fit_llm_reviewed = sum(
+        1 for r in content_fit_results.values() if r.method == "llm"
+    )
+
+    # --- Step 6: Score and output ---
+    logger.info("=" * 60)
+    logger.info("STEP 6: Scoring creators")
     logger.info("=" * 60)
 
     scored: list[ScoredCreator] = []
     for creator in survivors:
         tk = tiktok_data.get(creator.tiktok_handle)
         ig = ig_data.get(creator.ig_handle)
+        fit = content_fit_results.get(creator.ig_handle)
 
         result = _score_creator(creator, tk, ig, settings)
         if result is not None:
+            # Attach content-fit data
+            if fit:
+                result.content_fit_score = fit.score
+                result.content_fit_passed = fit.passed
+                result.content_fit_method = fit.method
+                result.content_fit_reason = fit.reason
             scored.append(result)
 
     stats.scored = len(scored)
 
-    # Sort by creator_score descending
-    scored.sort(key=lambda s: s.creator_score or 0, reverse=True)
+    # Sort: content-fit passes first, then by creator_score descending
+    scored.sort(
+        key=lambda s: (s.content_fit_passed, s.creator_score or 0),
+        reverse=True,
+    )
 
     # Write output CSV
     _write_output(scored, output_path)
@@ -329,6 +390,9 @@ async def run_modash_pipeline(
     logger.info(f"  IG enrich failed:       {stats.ig_enrich_failed}")
     logger.info(f"  TikTok enriched:        {stats.tiktok_enriched}")
     logger.info(f"  TikTok enrich failed:   {stats.tiktok_enrich_failed}")
+    logger.info(f"  Content-fit passed:     {stats.content_fit_passed}")
+    logger.info(f"  Content-fit failed:     {stats.content_fit_failed}")
+    logger.info(f"  Content-fit LLM reviewed: {stats.content_fit_llm_reviewed}")
     logger.info(f"  Scored & output:        {stats.scored}")
     logger.info(f"  Output:                 {output_path}")
 
@@ -459,6 +523,10 @@ def _write_output(scored: list[ScoredCreator], path: str | Path) -> None:
             "tiktok_handle": f"@{s.tiktok_handle}",
             "creator_score": _round(s.creator_score),
             "creator_tier": s.creator_tier or "",
+            "content_fit_passed": s.content_fit_passed,
+            "content_fit_score": _round(s.content_fit_score),
+            "content_fit_method": s.content_fit_method,
+            "content_fit_reason": (s.content_fit_reason or "")[:200],
             "recent_collabs": s.recent_collabs,
             # IG
             "ig_followers": s.ig_followers,
