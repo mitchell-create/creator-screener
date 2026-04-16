@@ -35,10 +35,12 @@ logger = logging.getLogger(__name__)
 class ModashCreator:
     """A creator from the Modash CSV export."""
     ig_handle: str
+    name: str = ""
     ig_followers: int | None = None
     ig_engagement_rate: float | None = None
     ig_avg_likes: float | None = None
     niche: str = ""
+    recent_collabs: str = ""
     # Populated after TikTok check
     has_tiktok: bool = False
     tiktok_handle: str = ""  # Defaults to same as ig_handle
@@ -63,6 +65,8 @@ class ScoredCreator:
     """Final scored output for a creator with both platforms."""
     ig_handle: str
     tiktok_handle: str
+    name: str = ""
+    recent_collabs: str = ""
 
     # IG profile data
     ig_followers: int | None = None
@@ -97,6 +101,11 @@ class ScoredCreator:
 def read_modash_csv(path: str | Path) -> list[ModashCreator]:
     """Read a Modash CSV export and extract IG handles.
 
+    Handles Modash-specific formats:
+      - Abbreviated followers: "42.9k", "1.2M", "34k"
+      - Percentage engagement rates: "11.85%", "4%"
+      - Handle format: "@username"
+
     Modash exports vary in format, so we try multiple column name patterns.
     """
     path = Path(path)
@@ -113,7 +122,7 @@ def read_modash_csv(path: str | Path) -> list[ModashCreator]:
 
     # Find the IG handle column — Modash uses various names
     ig_col = _find_column(df, [
-        "username", "instagram_username", "ig_username", "handle",
+        "handle", "username", "instagram_username", "ig_username",
         "instagram_handle", "ig_handle", "instagram", "ig",
         "profile_url", "url", "instagram_url",
     ])
@@ -124,6 +133,7 @@ def read_modash_csv(path: str | Path) -> list[ModashCreator]:
         )
 
     # Optional columns
+    name_col = _find_column(df, ["name", "display_name", "full_name", "creator_name"])
     followers_col = _find_column(df, [
         "followers", "follower_count", "ig_followers",
         "instagram_followers", "audience_size",
@@ -137,6 +147,10 @@ def read_modash_csv(path: str | Path) -> list[ModashCreator]:
     ])
     niche_col = _find_column(df, [
         "niche", "category", "topic", "content_category", "topics",
+    ])
+    collabs_col = _find_column(df, [
+        "recent_collabs", "collabs", "collaborations", "brands",
+        "brand_collabs", "partnerships",
     ])
 
     creators: list[ModashCreator] = []
@@ -155,14 +169,20 @@ def read_modash_csv(path: str | Path) -> list[ModashCreator]:
 
         creator = ModashCreator(
             ig_handle=handle,
-            ig_followers=_safe_int(row.get(followers_col)) if followers_col else None,
-            ig_engagement_rate=_safe_float(row.get(er_col)) if er_col else None,
-            ig_avg_likes=_safe_float(row.get(likes_col)) if likes_col else None,
+            name=str(row.get(name_col, "")).strip() if name_col else "",
+            ig_followers=_parse_abbreviated_number(row.get(followers_col)) if followers_col else None,
+            ig_engagement_rate=_parse_percentage(row.get(er_col)) if er_col else None,
+            ig_avg_likes=_parse_abbreviated_number_float(row.get(likes_col)) if likes_col else None,
             niche=str(row.get(niche_col, "")).strip() if niche_col else "",
+            recent_collabs=str(row.get(collabs_col, "")).strip() if collabs_col else "",
         )
         creators.append(creator)
 
-    logger.info(f"Loaded {len(creators)} unique IG creators from Modash CSV")
+    with_followers = sum(1 for c in creators if c.ig_followers is not None)
+    logger.info(
+        f"Loaded {len(creators)} unique IG creators from Modash CSV "
+        f"({with_followers} with follower data, {len(creators) - with_followers} without)"
+    )
     return creators
 
 
@@ -394,6 +414,8 @@ def _score_creator(
     return ScoredCreator(
         ig_handle=creator.ig_handle,
         tiktok_handle=creator.tiktok_handle,
+        name=creator.name,
+        recent_collabs=creator.recent_collabs,
         # IG data
         ig_followers=ig_data.followers if ig_data else creator.ig_followers,
         ig_following=ig_data.following if ig_data else None,
@@ -432,10 +454,12 @@ def _write_output(scored: list[ScoredCreator], path: str | Path) -> None:
     for i, s in enumerate(scored, 1):
         rows.append({
             "rank": i,
+            "name": s.name,
             "ig_handle": f"@{s.ig_handle}",
             "tiktok_handle": f"@{s.tiktok_handle}",
             "creator_score": _round(s.creator_score),
             "creator_tier": s.creator_tier or "",
+            "recent_collabs": s.recent_collabs,
             # IG
             "ig_followers": s.ig_followers,
             "ig_following": s.ig_following,
@@ -469,12 +493,100 @@ def _write_output(scored: list[ScoredCreator], path: str | Path) -> None:
 
 # --- Utility ---
 
+import re
+
+
 def _find_column(df: pd.DataFrame, candidates: list[str]) -> str | None:
     """Find the first matching column name from a list of candidates."""
     for name in candidates:
         if name in df.columns:
             return name
     return None
+
+
+def _normalize_handle(value: str) -> str | None:
+    """Normalize an Instagram handle from various formats.
+
+    Accepts: "@username", "username", "https://instagram.com/username/"
+    Returns: bare handle without @ or None.
+    """
+    if not value or value == "nan":
+        return None
+
+    value = value.strip().rstrip("/")
+
+    # Extract from URL
+    ig_match = re.search(r"instagram\.com/([^/?#]+)", value)
+    if ig_match:
+        return ig_match.group(1).lstrip("@")
+
+    # Strip @ prefix
+    return value.lstrip("@") if value else None
+
+
+def _parse_abbreviated_number(val) -> int | None:
+    """Parse abbreviated numbers like '42.9k', '1.2M', '34k', '10500'.
+
+    Handles Modash format where followers are displayed as abbreviated strings.
+    Returns integer or None.
+    """
+    if val is None:
+        return None
+
+    text = str(val).strip().replace(",", "")
+    if not text or text == "nan":
+        return None
+
+    # Already a plain number
+    try:
+        return int(float(text))
+    except ValueError:
+        pass
+
+    # Abbreviated: 42.9k, 1.2M, 34k
+    text_upper = text.upper()
+    multiplier = 1
+    if text_upper.endswith("K"):
+        multiplier = 1_000
+        text = text[:-1]
+    elif text_upper.endswith("M"):
+        multiplier = 1_000_000
+        text = text[:-1]
+    elif text_upper.endswith("B"):
+        multiplier = 1_000_000_000
+        text = text[:-1]
+
+    try:
+        return int(float(text) * multiplier)
+    except (ValueError, TypeError):
+        return None
+
+
+def _parse_abbreviated_number_float(val) -> float | None:
+    """Like _parse_abbreviated_number but returns float."""
+    result = _parse_abbreviated_number(val)
+    return float(result) if result is not None else None
+
+
+def _parse_percentage(val) -> float | None:
+    """Parse percentage strings like '11.85%', '4%', '2.91'.
+
+    Returns the numeric value (e.g., 11.85 for '11.85%').
+    """
+    if val is None:
+        return None
+
+    text = str(val).strip()
+    if not text or text == "nan":
+        return None
+
+    # Strip % sign
+    text = text.rstrip("%").strip()
+
+    try:
+        return float(text)
+    except (ValueError, TypeError):
+        return None
 
 
 def _safe_int(val) -> int | None:
