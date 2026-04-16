@@ -107,6 +107,7 @@ class ScoredCreator:
     affiliate_score: float | None = None
     affiliate_rank: int | None = None
     recommendation: str = ""
+    aff_tiktok_trust: float | None = None
     aff_tiktok_performance: float | None = None
     aff_tiktok_consistency: float | None = None
     aff_ig_engagement: float | None = None
@@ -420,6 +421,7 @@ async def run_modash_pipeline(
             s.affiliate_score = aff["affiliate_score"]
             s.affiliate_rank = aff["rank"]
             s.recommendation = aff.get("recommendation", "")
+            s.aff_tiktok_trust = aff.get("tiktok_trust")
             s.aff_tiktok_performance = aff.get("tiktok_performance")
             s.aff_tiktok_consistency = aff.get("tiktok_consistency")
             s.aff_ig_engagement = aff.get("ig_engagement")
@@ -580,6 +582,7 @@ def _write_output(scored: list[ScoredCreator], path: str | Path) -> None:
             "affiliate_score": s.affiliate_score,
             "affiliate_rank": s.affiliate_rank,
             "recommendation": (s.recommendation or "")[:300],
+            "aff_tiktok_trust": _round(s.aff_tiktok_trust),
             "aff_tiktok_performance": _round(s.aff_tiktok_performance),
             "aff_tiktok_consistency": _round(s.aff_tiktok_consistency),
             "aff_ig_engagement": _round(s.aff_ig_engagement),

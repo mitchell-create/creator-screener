@@ -302,13 +302,16 @@ NOT A FIT examples:
 - Fashion, travel, home decor, book, or entertainment-only creators
 - Creators who mention "healthy" occasionally but whose content is clearly not health-focused
 
-The key question: Does this creator regularly talk about PHYSICAL HEALTH, NUTRITION, or WELLNESS in a way that would make a probiotic supplement feel natural in their content?
+The key question: Does this creator REGULARLY and CONSISTENTLY talk about PHYSICAL HEALTH, NUTRITION, or WELLNESS in a way that would make a probiotic supplement feel natural in their content?
+
+IMPORTANT: One or two mentions of health topics across 10+ videos is NOT enough. Look for a PATTERN of health/wellness content — it should be a clear, recurring theme, not an occasional aside. A food creator who just shows food without discussing nutrition/health is NOT a fit. A beauty creator who only discusses topical products is NOT a fit.
 
 Rate on a scale of 0-10:
 - 0-3: Not a fit (content doesn't meaningfully cover health/wellness/nutrition)
-- 4-5: Borderline (some health adjacent content but not core to their brand)
-- 6-7: Good fit (health/wellness is a regular theme alongside other content)
-- 8-10: Excellent fit (health, nutrition, or supplements are central to their content)
+- 4-5: Borderline (occasional health mentions but NOT a regular theme)
+- 6: Some potential but health is not a core part of their brand
+- 7-8: Good fit (health/wellness is a regular, recurring theme)
+- 9-10: Excellent fit (health, nutrition, or supplements are central to their content)
 
 Respond with ONLY a JSON object:
 {{"score": <0-10>, "reasoning": "<1-2 sentence explanation>"}}"""
@@ -406,7 +409,7 @@ async def evaluate_content_fit(
         # LLM score 0-10 → normalize to 0-1
         result.score = llm_score / 10.0
 
-        if llm_score >= 6.0:
+        if llm_score >= 7.0:
             result.passed = True
             result.reason = f"LLM approved ({llm_score}/10): {llm_reasoning}"
         else:

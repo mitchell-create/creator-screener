@@ -1,15 +1,20 @@
 """Affiliate Readiness Score — final composite ranking for outreach.
 
-Combines content fit, TikTok performance, TikTok consistency, IG engagement,
-and authenticity into a single 0-100 score that answers: "should we reach
-out to this creator?"
+Combines content fit, TikTok trust factor, TikTok performance, TikTok
+consistency, IG engagement, and authenticity into a single 0-100 score
+that answers: "should we reach out to this creator?"
 
-Weights (TikTok-heavy by design):
-  - Content Fit:        25%  (are they relevant to our product?)
-  - TikTok Performance: 35%  (do they get views + real engagement?)
-  - TikTok Consistency: 15%  (do they post regularly with reliable reach?)
-  - IG Engagement:      15%  (are their IG followers real and active?)
-  - Authenticity:       10%  (organic signals, not botted)
+TRUST FACTOR is the #1 signal for non-perfect content fits. High TikTok
+comments = audience trusts the creator = they'll buy what's recommended.
+Comments indicate real back-and-forth conversation, not passive scrolling.
+
+Weights:
+  - Content Fit:          20%  (are they relevant to our product?)
+  - TikTok Trust Factor:  25%  (comments = audience trust = purchase intent)
+  - TikTok Performance:   20%  (views + like-to-view ratio + saves/shares)
+  - TikTok Consistency:   15%  (regular posting with reliable reach?)
+  - IG Engagement:        10%  (are their IG followers real and active?)
+  - Authenticity:         10%  (organic signals, not botted)
 
 Also includes an LLM recommendation for each creator — a 1-2 sentence
 pitch explaining why they're a good (or bad) affiliate pick.
@@ -28,10 +33,11 @@ import httpx
 logger = logging.getLogger(__name__)
 
 # Default weights
-W_CONTENT_FIT = 0.25
-W_TIKTOK_PERFORMANCE = 0.35
+W_CONTENT_FIT = 0.20
+W_TIKTOK_TRUST = 0.25       # THE most important signal for affiliate success
+W_TIKTOK_PERFORMANCE = 0.20
 W_TIKTOK_CONSISTENCY = 0.15
-W_IG_ENGAGEMENT = 0.15
+W_IG_ENGAGEMENT = 0.10
 W_AUTHENTICITY = 0.10
 
 
@@ -40,6 +46,7 @@ class AffiliateScore:
     """Final affiliate readiness score for a creator."""
     # Component scores (0.0 - 1.0)
     content_fit: float = 0.0
+    tiktok_trust: float = 0.0
     tiktok_performance: float = 0.0
     tiktok_consistency: float = 0.0
     ig_engagement: float = 0.0
@@ -51,6 +58,69 @@ class AffiliateScore:
     # LLM recommendation
     recommendation: str = ""
     llm_score: float | None = None
+
+
+def score_tiktok_trust(
+    view_counts: list[int],
+    comment_counts: list[int],
+    like_counts: list[int],
+) -> float:
+    """Score TikTok trust factor — the #1 signal for affiliate success.
+
+    High comments = audience actively engages with the creator in conversation.
+    This means they trust the creator, feel connected, and will act on
+    product recommendations. Passive viewers (views/likes) don't convert.
+
+    Signals:
+      1. Average comments per video (raw volume)
+      2. Comment-to-view ratio (engagement depth)
+      3. Comment-to-like ratio (are engaged viewers actually talking?)
+
+    Returns 0.0 - 1.0.
+    """
+    if not comment_counts or not view_counts:
+        return 0.0
+
+    scores: list[float] = []
+
+    # 1. Average comments per video — raw trust signal
+    # More comments = more people feel compelled to respond
+    avg_comments = statistics.mean(comment_counts) if comment_counts else 0
+
+    # Log scale: 1 comment → 0.15, 5 → 0.45, 10 → 0.60, 25 → 0.75, 50 → 0.85, 100+ → 1.0
+    if avg_comments > 0:
+        comment_vol_score = math.log(1 + avg_comments) / math.log(1 + 100)
+        scores.append(min(1.0, comment_vol_score))
+    else:
+        scores.append(0.0)
+
+    # 2. Comment-to-view ratio — engagement depth
+    # What % of viewers care enough to comment?
+    comment_view_ratios = []
+    for views, comments in zip(view_counts, comment_counts):
+        if views and views > 0 and comments is not None:
+            comment_view_ratios.append(comments / views * 100)
+
+    if comment_view_ratios:
+        median_cvr = statistics.median(comment_view_ratios)
+        # TikTok benchmarks: 0.1% = low, 0.5% = decent, 1% = good, 2%+ = excellent
+        cvr_score = min(1.0, median_cvr / 2.0)
+        scores.append(cvr_score)
+
+    # 3. Comment-to-like ratio — of people who liked, how many commented?
+    # Higher = more conversational, deeper trust
+    if like_counts and comment_counts:
+        cl_ratios = []
+        for likes, comments in zip(like_counts, comment_counts):
+            if likes and likes > 0 and comments is not None:
+                cl_ratios.append(comments / likes * 100)
+        if cl_ratios:
+            median_cl = statistics.median(cl_ratios)
+            # 1% = low, 3% = decent, 5% = good, 10%+ = excellent
+            cl_score = min(1.0, median_cl / 10.0)
+            scores.append(cl_score)
+
+    return sum(scores) / len(scores) if scores else 0.0
 
 
 def score_tiktok_performance(
@@ -275,6 +345,7 @@ def score_authenticity(
 
 def compute_affiliate_score(
     content_fit: float,
+    tiktok_trust: float,
     tiktok_performance: float,
     tiktok_consistency: float,
     ig_engagement: float,
@@ -283,6 +354,7 @@ def compute_affiliate_score(
     """Compute final weighted affiliate readiness score (0-100)."""
     raw = (
         content_fit * W_CONTENT_FIT
+        + tiktok_trust * W_TIKTOK_TRUST
         + tiktok_performance * W_TIKTOK_PERFORMANCE
         + tiktok_consistency * W_TIKTOK_CONSISTENCY
         + ig_engagement * W_IG_ENGAGEMENT
@@ -411,6 +483,12 @@ async def rank_creators(
         # --- Component Scores ---
         content_fit = creator.get("content_fit_score", 0.0)
 
+        tiktok_trust = score_tiktok_trust(
+            view_counts=tk.get("view_counts", []),
+            comment_counts=tk.get("comment_counts", []),
+            like_counts=tk.get("like_counts", []),
+        )
+
         tiktok_perf = score_tiktok_performance(
             view_counts=tk.get("view_counts", []),
             like_counts=tk.get("like_counts", []),
@@ -445,6 +523,7 @@ async def rank_creators(
 
         aff_score = compute_affiliate_score(
             content_fit=content_fit,
+            tiktok_trust=tiktok_trust,
             tiktok_performance=tiktok_perf,
             tiktok_consistency=tiktok_consist,
             ig_engagement=ig_eng,
@@ -475,14 +554,16 @@ async def rank_creators(
         logger.info(
             f"[{completed}/{total}] @{handle}: "
             f"affiliate_score={aff_score}, "
-            f"fit={content_fit:.2f}, tt_perf={tiktok_perf:.2f}, "
-            f"tt_consist={tiktok_consist:.2f}, ig_eng={ig_eng:.2f}"
+            f"fit={content_fit:.2f}, trust={tiktok_trust:.2f}, "
+            f"tt_perf={tiktok_perf:.2f}, tt_consist={tiktok_consist:.2f}, "
+            f"ig_eng={ig_eng:.2f}"
         )
 
         results.append({
             "handle": handle,
             "affiliate_score": aff_score,
             "content_fit": round(content_fit, 3),
+            "tiktok_trust": round(tiktok_trust, 3),
             "tiktok_performance": round(tiktok_perf, 3),
             "tiktok_consistency": round(tiktok_consist, 3),
             "ig_engagement": round(ig_eng, 3),
