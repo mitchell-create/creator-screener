@@ -1,11 +1,24 @@
-"""Instagram profile enrichment via RapidAPI (social-api1).
+"""Instagram profile enrichment via RapidAPI (Instagram Scraper Stable API).
 
 Replaces the Firecrawl-based scraper which was blocked by 403s.
 Uses two endpoints:
-  1. User Info — profile metadata (followers, following, bio, verified)
-  2. User Medias — recent posts with engagement (likes, comments)
+  1. Account Data — profile metadata (followers, following, bio, verified)
+  2. User Posts — recent posts with engagement (likes, comments)
 
-API: https://rapidapi.com/social-api1-instagram/api/instagram-scraper-api2
+API: https://rapidapi.com/thetechguy32744/api/instagram-scraper-stable-api
+Host: instagram-scraper-stable-api.p.rapidapi.com
+
+Endpoints use POST with application/x-www-form-urlencoded body.
+
+Account Data response: flat object with 58+ keys including:
+  username, full_name, biography, follower_count, following_count,
+  media_count, is_verified, is_private, is_business, profile_pic_url,
+  external_url, category, pk, id
+
+User Posts response: { posts: [ { node: { ...81 keys } } ] }
+  Per-post node includes: like_count, comment_count, taken_at (unix),
+  media_type (1=image, 2=video, 8=carousel), caption: { text: "..." },
+  view_count, code, pk, id
 """
 from __future__ import annotations
 
@@ -18,7 +31,8 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-_RAPIDAPI_BASE = "https://instagram-scraper-api2.p.rapidapi.com"
+_RAPIDAPI_BASE = "https://instagram-scraper-stable-api.p.rapidapi.com"
+_RAPIDAPI_HOST = "instagram-scraper-stable-api.p.rapidapi.com"
 
 
 @dataclass
@@ -28,6 +42,7 @@ class InstagramPostData:
     caption: str = ""
     likes: int = 0
     comments: int = 0
+    views: int | None = None
     media_type: str = ""  # "image", "video", "carousel"
     timestamp: int | None = None
 
@@ -46,6 +61,7 @@ class InstagramProfileData:
     is_private: bool = False
     profile_pic_url: str | None = None
     external_url: str | None = None
+    category: str | None = None
 
     # Computed from recent posts
     recent_posts: list[InstagramPostData] = field(default_factory=list)
@@ -55,12 +71,12 @@ class InstagramProfileData:
 
 
 class InstagramEnricher:
-    """Enriches Instagram profiles via RapidAPI Instagram Scraper API."""
+    """Enriches Instagram profiles via RapidAPI Instagram Scraper Stable API."""
 
     def __init__(
         self,
         rapidapi_key: str,
-        rapidapi_host: str = "instagram-scraper-api2.p.rapidapi.com",
+        rapidapi_host: str = _RAPIDAPI_HOST,
     ):
         self.rapidapi_key = rapidapi_key
         self.rapidapi_host = rapidapi_host
@@ -79,6 +95,7 @@ class InstagramEnricher:
         return {
             "x-rapidapi-key": self.rapidapi_key,
             "x-rapidapi-host": self.rapidapi_host,
+            "Content-Type": "application/x-www-form-urlencoded",
         }
 
     async def enrich_profile(
@@ -103,8 +120,8 @@ class InstagramEnricher:
         delay = random.uniform(*delay_range)
         await asyncio.sleep(delay)
 
-        # Step 1: Get profile info
-        profile = await self._fetch_user_info(clean_handle)
+        # Step 1: Get profile info via Account Data endpoint
+        profile = await self._fetch_account_data(clean_handle)
         if profile is None:
             return None
 
@@ -115,32 +132,39 @@ class InstagramEnricher:
         # Small delay between calls
         await asyncio.sleep(random.uniform(0.3, 1.0))
 
-        # Step 2: Get recent posts for engagement
-        posts = await self._fetch_user_medias(clean_handle, count=post_count)
+        # Step 2: Get recent posts for engagement via User Posts endpoint
+        posts = await self._fetch_user_posts(clean_handle, count=post_count)
         if posts:
             profile.recent_posts = posts
             self._compute_engagement(profile)
 
         return profile
 
-    async def _fetch_user_info(self, handle: str) -> InstagramProfileData | None:
-        """Fetch profile metadata from the User Info endpoint."""
+    async def _fetch_account_data(self, handle: str) -> InstagramProfileData | None:
+        """Fetch profile metadata via POST /ig_get_fb_profile.php.
+
+        Response is a flat JSON object with keys like:
+          username, full_name, biography, follower_count, following_count,
+          media_count, is_verified, is_private, is_business, profile_pic_url,
+          external_url, category
+        """
         client = await self._get_client()
 
         try:
-            resp = await client.get(
-                f"{_RAPIDAPI_BASE}/v1/info",
+            resp = await client.post(
+                f"{_RAPIDAPI_BASE}/ig_get_fb_profile.php",
                 headers=self._headers(),
-                params={"username_or_id_or_url": handle},
+                data={
+                    "username_or_url": handle,
+                    "data": "basic",
+                },
             )
             resp.raise_for_status()
-            data = resp.json()
+            user = resp.json()
 
-            # The API wraps the response in a "data" key
-            user = data.get("data", data)
-
+            # Response is a flat object — no wrapper
             profile = InstagramProfileData(
-                handle=handle,
+                handle=user.get("username", handle),
                 display_name=user.get("full_name"),
                 bio=user.get("biography"),
                 followers=_safe_int(user.get("follower_count")),
@@ -149,8 +173,9 @@ class InstagramEnricher:
                 verified=bool(user.get("is_verified", False)),
                 is_business=bool(user.get("is_business", False)),
                 is_private=bool(user.get("is_private", False)),
-                profile_pic_url=user.get("profile_pic_url_hd") or user.get("profile_pic_url"),
+                profile_pic_url=user.get("profile_pic_url"),
                 external_url=user.get("external_url"),
+                category=user.get("category"),
             )
 
             logger.info(
@@ -172,45 +197,49 @@ class InstagramEnricher:
             logger.warning(f"IG @{handle}: fetch failed: {e}")
             return None
 
-    async def _fetch_user_medias(
+    async def _fetch_user_posts(
         self,
         handle: str,
         count: int = 12,
     ) -> list[InstagramPostData]:
-        """Fetch recent posts from the User Medias endpoint."""
+        """Fetch recent posts via POST /get_ig_user_posts.php.
+
+        Response format: { posts: [ { node: { ...fields } } ], pagination_token: "..." }
+        Each node contains: like_count, comment_count, taken_at, media_type,
+        caption: { text: "..." }, view_count, code, pk, id
+        """
         client = await self._get_client()
 
         try:
-            resp = await client.get(
-                f"{_RAPIDAPI_BASE}/v1/posts",
+            resp = await client.post(
+                f"{_RAPIDAPI_BASE}/get_ig_user_posts.php",
                 headers=self._headers(),
-                params={
-                    "username_or_id_or_url": handle,
-                    "amount": min(count, 50),  # API may cap at 50
+                data={
+                    "username_or_url": handle,
+                    "amount": str(min(count, 50)),
                 },
             )
             resp.raise_for_status()
             data = resp.json()
 
-            items = data.get("data", {}).get("items", [])
-            if not items:
-                # Try alternate response format
-                items = data.get("items", data.get("data", []))
-                if isinstance(items, dict):
-                    items = items.get("items", [])
+            # Response: { posts: [ { node: { ... } } ] }
+            raw_posts = data.get("posts", [])
 
             posts: list[InstagramPostData] = []
-            for item in items[:count]:
-                if not isinstance(item, dict):
+            for item in raw_posts[:count]:
+                # Each item is { node: { ... } }
+                node = item.get("node", item) if isinstance(item, dict) else {}
+                if not isinstance(node, dict):
                     continue
 
                 post = InstagramPostData(
-                    post_id=str(item.get("id", item.get("pk", ""))),
-                    caption=_extract_caption(item),
-                    likes=_safe_int(item.get("like_count", 0)) or 0,
-                    comments=_safe_int(item.get("comment_count", 0)) or 0,
-                    media_type=_classify_media_type(item),
-                    timestamp=_safe_int(item.get("taken_at")),
+                    post_id=str(node.get("id", node.get("pk", ""))),
+                    caption=_extract_caption(node),
+                    likes=_safe_int(node.get("like_count", 0)) or 0,
+                    comments=_safe_int(node.get("comment_count", 0)) or 0,
+                    views=_safe_int(node.get("view_count")),
+                    media_type=_classify_media_type(node),
+                    timestamp=_safe_int(node.get("taken_at")),
                 )
                 posts.append(post)
 
@@ -218,10 +247,10 @@ class InstagramEnricher:
             return posts
 
         except httpx.HTTPStatusError as e:
-            logger.warning(f"IG @{handle}: media fetch error {e.response.status_code}")
+            logger.warning(f"IG @{handle}: posts fetch error {e.response.status_code}")
             return []
         except Exception as e:
-            logger.warning(f"IG @{handle}: media fetch failed: {e}")
+            logger.warning(f"IG @{handle}: posts fetch failed: {e}")
             return []
 
     @staticmethod
@@ -301,9 +330,12 @@ def _safe_int(val) -> int | None:
         return None
 
 
-def _extract_caption(item: dict) -> str:
-    """Extract caption text from various API response formats."""
-    caption = item.get("caption")
+def _extract_caption(node: dict) -> str:
+    """Extract caption text from post node.
+
+    Stable API format: caption is an object { text: "...", created_at: ..., pk: ... }
+    """
+    caption = node.get("caption")
     if isinstance(caption, dict):
         return caption.get("text", "")
     if isinstance(caption, str):
@@ -311,16 +343,33 @@ def _extract_caption(item: dict) -> str:
     return ""
 
 
-def _classify_media_type(item: dict) -> str:
-    """Classify post media type."""
-    media_type = item.get("media_type")
-    if media_type == 1 or media_type == "IMAGE":
+def _classify_media_type(node: dict) -> str:
+    """Classify post media type from the Stable API response.
+
+    media_type values from Instagram:
+      1 = image
+      2 = video
+      8 = carousel/album
+
+    Also checks product_type for further classification.
+    """
+    media_type = node.get("media_type")
+    if media_type == 1:
         return "image"
-    if media_type == 2 or media_type == "VIDEO":
+    if media_type == 2:
         return "video"
-    if media_type == 8 or media_type == "CAROUSEL":
+    if media_type == 8:
         return "carousel"
-    # Check for video-specific fields
-    if item.get("video_duration") or item.get("video_url"):
+
+    # Fallback: check product_type
+    product_type = node.get("product_type", "")
+    if "carousel" in str(product_type).lower():
+        return "carousel"
+    if "clip" in str(product_type).lower() or "reel" in str(product_type).lower():
         return "video"
+
+    # Check for video-specific fields
+    if node.get("video_duration") or node.get("video_versions"):
+        return "video"
+
     return "image"
