@@ -142,12 +142,13 @@ WEAK_KEYWORDS: dict[str, float] = {
 # Combine all keywords
 ALL_KEYWORDS: dict[str, float] = {**STRONG_KEYWORDS, **MEDIUM_KEYWORDS, **WEAK_KEYWORDS}
 
-# Thresholds — intentionally strict. We'd rather send borderline cases to
-# the LLM than auto-pass creators who just happen to use health-adjacent words.
-# Pure skincare, food, or beauty creators should NOT auto-pass.
-KEYWORD_PASS_THRESHOLD = 6.0    # Total weighted score to auto-pass (needs strong health signals)
+# Thresholds — NO auto-pass. Every creator goes through LLM review.
+# Keywords alone can't distinguish "hair supplements" from "gut supplements"
+# or "cat nutrition" from "human nutrition." The LLM catches these nuances
+# and costs <$0.001 per creator, so there's no reason to skip it.
+KEYWORD_PASS_THRESHOLD = 999.0  # Effectively disabled — nobody auto-passes
 KEYWORD_FAIL_THRESHOLD = 0.5    # Below this → auto-fail (truly zero health signal)
-# Between fail and pass → ambiguous → send to LLM for proper judgment
+# Everything above fail threshold → sent to LLM for proper judgment
 
 
 @dataclass
