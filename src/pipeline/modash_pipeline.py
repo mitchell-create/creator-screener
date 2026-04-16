@@ -32,6 +32,7 @@ from src.analyzers.content_fit import (
 from src.config import Settings
 from src.models_creator import CreatorProfile, PlatformMetrics
 from src.scoring.creator_signals import score_creator
+from src.scoring.affiliate_readiness import rank_creators
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +102,15 @@ class ScoredCreator:
     content_fit_passed: bool = True
     content_fit_method: str = ""
     content_fit_reason: str = ""
+
+    # Affiliate readiness (final composite)
+    affiliate_score: float | None = None
+    affiliate_rank: int | None = None
+    recommendation: str = ""
+    aff_tiktok_performance: float | None = None
+    aff_tiktok_consistency: float | None = None
+    aff_ig_engagement: float | None = None
+    aff_authenticity: float | None = None
 
     # Creator scores (0.0 - 1.0)
     engagement_score: float | None = None
@@ -369,11 +379,55 @@ async def run_modash_pipeline(
 
     stats.scored = len(scored)
 
-    # Sort: content-fit passes first, then by creator_score descending
-    scored.sort(
-        key=lambda s: (s.content_fit_passed, s.creator_score or 0),
-        reverse=True,
+    # --- Step 7: Affiliate Readiness Ranking (content-fit passes only) ---
+    logger.info("=" * 60)
+    logger.info("STEP 7: Affiliate readiness ranking (content-fit passes only)")
+    logger.info("=" * 60)
+
+    # Build data bundles for affiliate scoring — only for content-fit passes
+    fit_passed = [s for s in scored if s.content_fit_passed]
+    fit_failed = [s for s in scored if not s.content_fit_passed]
+
+    affiliate_input: list[dict] = []
+    for s in fit_passed:
+        tk = tiktok_data.get(s.tiktok_handle)
+        ig = ig_data.get(s.ig_handle)
+        tk_descriptions = tk.get("descriptions", []) if tk else []
+        ig_captions = [p.caption for p in ig.recent_posts if p.caption] if ig else []
+
+        affiliate_input.append({
+            "handle": s.ig_handle,
+            "content_fit_score": s.content_fit_score or 0.0,
+            "tiktok_data": tk,
+            "ig_data": ig,
+            "bio": ig.bio if ig and ig.bio else "",
+            "content_texts": tk_descriptions + ig_captions,
+        })
+
+    affiliate_results = await rank_creators(
+        creators_data=affiliate_input,
+        campaign_brief=campaign_brief,
+        openrouter_api_key=settings.openrouter_api_key,
+        openrouter_model=settings.openrouter_model,
+        concurrency=5,
     )
+
+    # Merge affiliate scores back into scored creators
+    aff_by_handle = {r["handle"]: r for r in affiliate_results}
+    for s in fit_passed:
+        aff = aff_by_handle.get(s.ig_handle)
+        if aff:
+            s.affiliate_score = aff["affiliate_score"]
+            s.affiliate_rank = aff["rank"]
+            s.recommendation = aff.get("recommendation", "")
+            s.aff_tiktok_performance = aff.get("tiktok_performance")
+            s.aff_tiktok_consistency = aff.get("tiktok_consistency")
+            s.aff_ig_engagement = aff.get("ig_engagement")
+            s.aff_authenticity = aff.get("authenticity")
+
+    # Sort: content-fit passes first (by affiliate_score), then failures
+    fit_passed.sort(key=lambda s: s.affiliate_score or 0, reverse=True)
+    scored = fit_passed + fit_failed
 
     # Write output CSV
     _write_output(scored, output_path)
@@ -523,6 +577,13 @@ def _write_output(scored: list[ScoredCreator], path: str | Path) -> None:
             "tiktok_handle": f"@{s.tiktok_handle}",
             "creator_score": _round(s.creator_score),
             "creator_tier": s.creator_tier or "",
+            "affiliate_score": s.affiliate_score,
+            "affiliate_rank": s.affiliate_rank,
+            "recommendation": (s.recommendation or "")[:300],
+            "aff_tiktok_performance": _round(s.aff_tiktok_performance),
+            "aff_tiktok_consistency": _round(s.aff_tiktok_consistency),
+            "aff_ig_engagement": _round(s.aff_ig_engagement),
+            "aff_authenticity": _round(s.aff_authenticity),
             "content_fit_passed": s.content_fit_passed,
             "content_fit_score": _round(s.content_fit_score),
             "content_fit_method": s.content_fit_method,
