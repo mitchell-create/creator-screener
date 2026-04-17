@@ -71,6 +71,10 @@ def score_tiktok_trust(
     This means they trust the creator, feel connected, and will act on
     product recommendations. Passive viewers (views/likes) don't convert.
 
+    IMPORTANT: Requires a meaningful sample size. A creator with 2 posts
+    and high comments is NOT trustworthy data — it could be a fluke.
+    Minimum 5 videos to get a real trust score.
+
     Signals:
       1. Average comments per video (raw volume)
       2. Comment-to-view ratio (engagement depth)
@@ -80,6 +84,12 @@ def score_tiktok_trust(
     """
     if not comment_counts or not view_counts:
         return 0.0
+
+    # Penalize tiny sample sizes — need at least 5 videos for reliable trust signal
+    sample_size = len(view_counts)
+    if sample_size < 3:
+        return 0.1  # Essentially no data
+    sample_penalty = min(1.0, sample_size / 5.0)  # Ramps from 0.6 at 3 videos to 1.0 at 5+
 
     scores: list[float] = []
 
@@ -120,7 +130,8 @@ def score_tiktok_trust(
             cl_score = min(1.0, median_cl / 10.0)
             scores.append(cl_score)
 
-    return sum(scores) / len(scores) if scores else 0.0
+    raw_score = sum(scores) / len(scores) if scores else 0.0
+    return raw_score * sample_penalty  # Discount for small sample sizes
 
 
 def score_tiktok_performance(
@@ -144,6 +155,12 @@ def score_tiktok_performance(
     """
     if not view_counts or not like_counts:
         return 0.0
+
+    # Penalize tiny TikTok accounts
+    sample_size = len(view_counts)
+    if sample_size < 3:
+        return 0.1
+    sample_penalty = min(1.0, sample_size / 5.0)
 
     scores: list[float] = []
 
@@ -195,7 +212,8 @@ def score_tiktok_performance(
             comment_score = min(1.0, math.log(1 + median_comments * 10) / math.log(21))
             scores.append(comment_score)
 
-    return sum(scores) / len(scores) if scores else 0.0
+    raw_score = sum(scores) / len(scores) if scores else 0.0
+    return raw_score * sample_penalty
 
 
 def score_tiktok_consistency(

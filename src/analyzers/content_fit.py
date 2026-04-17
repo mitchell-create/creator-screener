@@ -409,7 +409,7 @@ async def evaluate_content_fit(
         # LLM score 0-10 → normalize to 0-1
         result.score = llm_score / 10.0
 
-        if llm_score >= 7.0:
+        if llm_score >= 8.0:
             result.passed = True
             result.reason = f"LLM approved ({llm_score}/10): {llm_reasoning}"
         else:
