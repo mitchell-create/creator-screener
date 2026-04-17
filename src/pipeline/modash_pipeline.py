@@ -145,17 +145,23 @@ def read_modash_csv(path: str | Path) -> list[ModashCreator]:
     # Normalize column names
     df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
 
-    # Find the IG handle column — Modash uses various names
+    # Find the IG handle column — supports Modash, KOL lists, etc.
     ig_col = _find_column(df, [
         "handle", "username", "instagram_username", "ig_username",
         "instagram_handle", "ig_handle", "instagram", "ig",
         "profile_url", "url", "instagram_url",
+        "account(s)", "accounts", "account",
     ])
     if ig_col is None:
         raise ValueError(
             f"Cannot find Instagram handle column in Modash CSV. "
             f"Found columns: {list(df.columns)}"
         )
+
+    # Check for explicit TikTok handle column (KOL list format)
+    tiktok_col = _find_column(df, [
+        "tiktok", "tiktok_handle", "tiktok_username", "tt_handle", "tt",
+    ])
 
     # Optional columns
     name_col = _find_column(df, ["name", "display_name", "full_name", "creator_name"])
@@ -177,6 +183,9 @@ def read_modash_csv(path: str | Path) -> list[ModashCreator]:
         "recent_collabs", "collabs", "collaborations", "brands",
         "brand_collabs", "partnerships",
     ])
+    notes_col = _find_column(df, [
+        "notes_/_status", "notes", "notes/status", "description",
+    ])
 
     creators: list[ModashCreator] = []
     seen: set[str] = set()
@@ -186,21 +195,41 @@ def read_modash_csv(path: str | Path) -> list[ModashCreator]:
         if not raw_handle or raw_handle == "nan":
             continue
 
+        # Skip separator rows (e.g., "KIDS" in KOL lists)
+        name_val = str(row.get(name_col, "")).strip() if name_col else ""
+        if name_val.upper() in ("KIDS", "ADULTS", "---", "SEPARATOR"):
+            continue
+
         # Normalize: strip @, extract from URL if needed
         handle = _normalize_handle(raw_handle)
         if not handle or handle in seen:
             continue
         seen.add(handle)
 
+        # Parse explicit TikTok handle from CSV if available
+        explicit_tiktok = ""
+        if tiktok_col:
+            tt_raw = str(row.get(tiktok_col, "")).strip()
+            if tt_raw and tt_raw != "nan" and tt_raw != "-":
+                explicit_tiktok = _normalize_tiktok_handle(tt_raw)
+
+        # Use notes column as niche/collabs context if no dedicated columns
+        notes = str(row.get(notes_col, "")).strip() if notes_col else ""
+
         creator = ModashCreator(
             ig_handle=handle,
-            name=str(row.get(name_col, "")).strip() if name_col else "",
+            name=name_val,
             ig_followers=_parse_abbreviated_number(row.get(followers_col)) if followers_col else None,
             ig_engagement_rate=_parse_percentage(row.get(er_col)) if er_col else None,
             ig_avg_likes=_parse_abbreviated_number_float(row.get(likes_col)) if likes_col else None,
-            niche=str(row.get(niche_col, "")).strip() if niche_col else "",
+            niche=str(row.get(niche_col, "")).strip() if niche_col else notes,
             recent_collabs=str(row.get(collabs_col, "")).strip() if collabs_col else "",
         )
+        # If we have an explicit TikTok handle, pre-set it
+        if explicit_tiktok:
+            creator.has_tiktok = True
+            creator.tiktok_handle = explicit_tiktok
+
         creators.append(creator)
 
     with_followers = sum(1 for c in creators if c.ig_followers is not None)
@@ -243,22 +272,30 @@ async def run_modash_pipeline(
         return stats
 
     # --- Step 2: Check TikTok existence (FREE) ---
-    logger.info("=" * 60)
-    logger.info(f"STEP 2: Checking TikTok for {len(creators)} IG handles (free via yt-dlp)")
-    logger.info("=" * 60)
+    # Skip creators who already have TikTok handles from the CSV
+    already_have_tt = [c for c in creators if c.has_tiktok and c.tiktok_handle]
+    need_tt_check = [c for c in creators if not c.has_tiktok]
 
-    ig_handles = [c.ig_handle for c in creators]
-    tiktok_results = await batch_check_tiktok(
-        ig_handles,
-        concurrency=tiktok_concurrency,
+    logger.info("=" * 60)
+    logger.info(
+        f"STEP 2: Checking TikTok for {len(need_tt_check)} IG handles "
+        f"({len(already_have_tt)} already have TikTok from CSV)"
     )
+    logger.info("=" * 60)
 
-    # Update creators with TikTok status
-    for creator in creators:
-        exists = tiktok_results.get(creator.ig_handle, False)
-        creator.has_tiktok = exists
-        if exists:
-            creator.tiktok_handle = creator.ig_handle  # Same handle on both platforms
+    if need_tt_check:
+        ig_handles = [c.ig_handle for c in need_tt_check]
+        tiktok_results = await batch_check_tiktok(
+            ig_handles,
+            concurrency=tiktok_concurrency,
+        )
+
+        # Update creators with TikTok status
+        for creator in need_tt_check:
+            exists = tiktok_results.get(creator.ig_handle, False)
+            creator.has_tiktok = exists
+            if exists:
+                creator.tiktok_handle = creator.ig_handle  # Same handle on both platforms
 
     survivors = [c for c in creators if c.has_tiktok]
     removed = [c for c in creators if not c.has_tiktok]
@@ -634,6 +671,26 @@ def _find_column(df: pd.DataFrame, candidates: list[str]) -> str | None:
         if name in df.columns:
             return name
     return None
+
+
+def _normalize_tiktok_handle(value: str) -> str:
+    """Normalize a TikTok handle from various formats.
+
+    Accepts: "@handle", "handle", "https://tiktok.com/@handle", full URLs
+    Returns: bare handle without @.
+    """
+    if not value or value == "nan" or value == "-":
+        return ""
+
+    value = value.strip().rstrip("/")
+
+    # Extract from URL
+    tt_match = re.search(r"tiktok\.com/@([^/?#]+)", value)
+    if tt_match:
+        return tt_match.group(1)
+
+    # Strip @ prefix
+    return value.lstrip("@")
 
 
 def _normalize_handle(value: str) -> str | None:
