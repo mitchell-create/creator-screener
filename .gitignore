@@ -42,9 +42,10 @@ models/
 .coverage
 htmlcov/
 
-# Pipeline output CSVs (generated at runtime)
-data/*output*.csv
-data/*_passed*.csv
+# Pipeline data (creator CSVs, exports, drafts — may contain PII)
+data/*.csv
+data/*.json
+!data/sample_input.csv
 
 # Claude
 .claude/
